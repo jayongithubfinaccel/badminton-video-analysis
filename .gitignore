@@ -31,6 +31,14 @@ env/
 .DS_Store
 Thumbs.db
 
+# Video files (too large for git)
+input/*.mp4
+input/*.avi
+input/*.mkv
+
+# Output files (generated)
+output/
+
 # Data exports (keep sample data)
 data/exports/
 
