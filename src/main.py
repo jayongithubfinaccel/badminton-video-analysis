@@ -201,8 +201,8 @@ class AnalysisPipeline:
             # Skip intro footage for rallies starting at frame 0
             start_frame = rally.start_frame
             if start_frame == 0:
-                # BWF broadcasts have ~5s of intro before actual play
-                start_frame = int(self.fps * 5)
+                # BWF broadcasts have ~6s of intro before actual serve
+                start_frame = int(self.fps * 6)
 
             print(
                 f"       Rally {rally.score_sequence}: "
