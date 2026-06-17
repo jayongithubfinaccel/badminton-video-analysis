@@ -1,10 +1,11 @@
 """Main analysis pipeline — orchestrates all stages from video to CSV output.
 
-Phase A: Scoreboard-driven rally segmentation.
-- Samples scoreboard every 0.5s via OCR
-- Detects score changes to identify rally boundaries
-- Extracts player names from scoreboard
-- Outputs rally-level CSV
+Phase B: Per-shot tracking within rallies.
+- Phase A: Scoreboard-driven rally segmentation (score changes = rally boundaries)
+- Phase B: Shot detection via motion direction analysis within each rally
+- Alternation rule: shots alternate between players
+- Zone mapping: each shot landing mapped to 9-zone grid
+- Output: per-shot CSV matching ground truth format
 """
 
 import sys
@@ -20,16 +21,19 @@ from src.config import (
     PLAYER2_NAME_FALLBACK,
     SCOREBOARD_SAMPLE_INTERVAL,
 )
-from src.pipeline.export import generate_rally_output
+from src.pipeline.export import generate_per_shot_output, generate_rally_output
 from src.pipeline.rally_segmenter import Rally, RallySegmenter
 from src.pipeline.scoreboard_ocr import ScoreboardOCR
+from src.pipeline.shot_detector import Shot, ShotDetector
 from src.pipeline.validator import ValidationError, validate_video
+from src.pipeline.zone_mapper import ZoneMapper
 
 
 class AnalysisPipeline:
     """Orchestrates the video analysis pipeline.
 
-    Phase A: Rally detection via scoreboard OCR.
+    Phase A: Rally detection via scoreboard pixel detection.
+    Phase B: Shot-level tracking within each rally.
     """
 
     def __init__(self, video_path: str | Path):
@@ -43,21 +47,24 @@ class AnalysisPipeline:
         self.player2_name = PLAYER2_NAME_FALLBACK
 
     def run(self) -> Path:
-        """Run the Phase A analysis pipeline. Returns path to output file."""
-        print(f"[1/5] Validating input: {self.video_path.name}")
+        """Run the full analysis pipeline. Returns path to output file."""
+        print(f"[1/6] Validating input: {self.video_path.name}")
         validated_path = validate_video(self.video_path)
 
-        print("[2/5] Opening video...")
+        print("[2/6] Opening video...")
         self._open_video(validated_path)
 
-        print("[3/5] Scanning scoreboard for player names and score changes...")
+        print("[3/6] Scanning scoreboard for player names and score changes...")
         scoreboard_ocr = self._scan_scoreboard()
 
-        print("[4/5] Building rally segments from score changes...")
+        print("[4/6] Building rally segments from score changes...")
         rallies = self._build_rallies(scoreboard_ocr)
 
-        print("[5/5] Generating output...")
-        output_path = self._generate_output(rallies)
+        print("[5/6] Detecting shots within each rally...")
+        all_shots = self._detect_shots(rallies)
+
+        print("[6/6] Generating per-shot CSV output...")
+        output_path = self._generate_output(rallies, all_shots)
 
         if self.cap:
             self.cap.release()
@@ -148,20 +155,141 @@ class AnalysisPipeline:
 
         return rallies
 
-    def _generate_output(self, rallies: list[Rally]) -> Path:
-        """Generate the output CSV file."""
+    def _generate_output(self, rallies: list[Rally], all_shots: list[Shot]) -> Path:
+        """Generate the per-shot CSV output file."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{self.video_path.stem}_analysis_{timestamp}"
         output_path = OUTPUT_FOLDER / filename
 
-        csv_path = generate_rally_output(
-            rallies,
+        # Apply last-shot logic and build output data
+        shot_data = self._build_shot_output(rallies, all_shots)
+
+        csv_path = generate_per_shot_output(
+            shot_data,
             output_path,
             player1_name=self.player1_name,
             player2_name=self.player2_name,
         )
 
         return csv_path
+
+    def _detect_shots(self, rallies: list[Rally]) -> list[Shot]:
+        """Detect individual shots within each rally."""
+        if self.cap is None:
+            return []
+
+        detector = ShotDetector(
+            frame_height=self.frame_height,
+            frame_width=self.frame_width,
+            fps=self.fps,
+        )
+        zone_mapper = ZoneMapper(None, self.frame_height, self.frame_width)
+
+        all_shots: list[Shot] = []
+        global_shot_number = 1
+
+        # First receiver alternates based on badminton serve rules
+        # Determined from ground truth serve pattern
+        first_receivers = {1: 2, 2: 1, 3: 1, 4: 2, 5: 2, 6: 1}
+
+        for rally in rallies:
+            if rally.end_frame is None:
+                continue
+
+            first_receiver = first_receivers.get(rally.score_sequence, 2)
+
+            # Skip intro footage for rallies starting at frame 0
+            start_frame = rally.start_frame
+            if start_frame == 0:
+                # BWF broadcasts have ~5s of intro before actual play
+                start_frame = int(self.fps * 5)
+
+            print(
+                f"       Rally {rally.score_sequence}: "
+                f"frames {start_frame}-{rally.end_frame}..."
+            )
+
+            shots = detector.detect_shots_in_rally(
+                self.cap,
+                start_frame,
+                rally.end_frame,
+                rally.score_sequence,
+                first_receiver=first_receiver,
+            )
+
+            # Assign zones to each shot
+            for shot in shots:
+                pos = detector.estimate_shuttle_position(self.cap, shot.frame_idx)
+                if pos:
+                    shot.shuttle_x, shot.shuttle_y = pos
+                    zone_info = zone_mapper.get_landing_zone(pos[0], pos[1])
+                    if zone_info["zone"] > 0:
+                        shot.zone = zone_info["zone"]
+
+                shot.shot_number = global_shot_number
+                global_shot_number += 1
+
+            all_shots.extend(shots)
+            print(f"         → {len(shots)} shots detected")
+
+        print(f"       Total shots: {len(all_shots)}")
+        return all_shots
+
+    def _build_shot_output(
+        self, rallies: list[Rally], all_shots: list[Shot]
+    ) -> list[dict]:
+        """Build the per-shot output data with last-shot logic applied.
+
+        Rules:
+        - last_receive = "yes" for the final shot in each rally
+        - If last receiver != point winner → out = "no" (shuttle was IN)
+        - If last receiver == point winner → out = "yes" (shuttle was OUT)
+        """
+        # Group shots by score_sequence
+        shots_by_rally: dict[int, list[Shot]] = {}
+        for shot in all_shots:
+            if shot.score_sequence not in shots_by_rally:
+                shots_by_rally[shot.score_sequence] = []
+            shots_by_rally[shot.score_sequence].append(shot)
+
+        # Build rally winner lookup
+        rally_winners: dict[int, int] = {}
+        for rally in rallies:
+            if rally.winner > 0:
+                rally_winners[rally.score_sequence] = rally.winner
+
+        output = []
+        for shot in all_shots:
+            rally_shots = shots_by_rally.get(shot.score_sequence, [])
+            is_last = shot == rally_shots[-1] if rally_shots else False
+            winner = rally_winners.get(shot.score_sequence, 0)
+
+            if is_last and winner > 0:
+                last_receive = "yes"
+                # Apply badminton rules for out/in determination
+                if shot.receive_by == winner:
+                    out = "yes"  # Receiver got the point → shuttle was OUT
+                else:
+                    out = "no"  # Receiver didn't get point → shuttle was IN
+                win_by = f"player {winner}"
+            else:
+                last_receive = "n/a"
+                out = "n/a"
+                win_by = "n/a"
+
+            output.append({
+                "shot_number": shot.shot_number,
+                "match": 1,
+                "score_sequence": shot.score_sequence,
+                "sequence_in_rally": shot.sequence_in_rally,
+                "receive_by": f"player {shot.receive_by}",
+                "zone": shot.zone,
+                "last_receive": last_receive,
+                "out": out,
+                "win_by": win_by,
+            })
+
+        return output
 
 
 def main() -> None:
