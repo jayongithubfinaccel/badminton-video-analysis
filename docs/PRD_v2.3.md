@@ -416,22 +416,35 @@ The horizontal axis improved substantially; the vertical (front/back) axis impro
 
 ---
 
-### Phase D — Integrate TrackNet for Shuttle Detection *(was Phase C in v2.2 — deferred, not removed)*
+### Phase D — Integrate TrackNet for Shuttle Detection ✅ DONE (2026-06-29) *(was Phase C in v2.2 — deferred, not removed)*
 
-**Goal:** Replace remaining blob/motion-based shuttle position estimation with a specialized shuttle detection model, once Phase C's player-tracking foundation and generalization fixes are in place.
+**Goal:** Replace the player-position proxy (Phase C.1) with real shuttle position, once two independent proxy refinements (homography, lunge-apex) had each hit the same front/back-axis ceiling for the same underlying reason — player position is not shuttle position (see Phase C.1 decision log).
 
-**Approach:** (unchanged from v2.2)
-1. Download/integrate TrackNetV3 pre-trained weights for badminton ([qaz812345/TrackNetV3](https://github.com/qaz812345/TrackNetV3) — includes `TrackNet_best.pt` and `InpaintNet_best.pt`)
-2. Run TrackNet on rally frames to get per-frame shuttle (x, y) coordinates
-3. Use TrackNet trajectory to more accurately detect:
-   - Shot exchanges (direction changes in shuttle trajectory)
-   - Landing positions (trajectory endpoints) — this is what finally makes zone mapping precise rather than a player-position proxy
-4. Combine with Phase C's player detections for a full shuttle + player hit-detection pipeline (per the Sensors 2024 TrackNet+YOLOv7 reference architecture)
+**What was built:**
+1. Cloned and ran [TrackNetV3](https://github.com/qaz812345/TrackNetV3) (qaz812345) — pretrained temporal CNN, no fine-tuning, `--eval_mode nonoverlap` for CPU feasibility (~52 min for video 1's 2689 frames). Required several Windows/CPU compatibility patches to the upstream repo (device handling, forced `num_workers=0` to avoid a Windows spawn-pickling failure — see `docs/RESULTS.md` "Phase D" for detail).
+2. Visually validated predictions against the source video before trusting them (spot-checked frames showing the shuttle correctly isolated mid-flight and at point of racket contact). 77.3% visibility rate.
+3. Built `src/pipeline/shuttle_tracker.py` — generates/caches the per-video shuttle-prediction CSV via the external TrackNetV3 install, and exposes `ShuttleTracker.landing_point(prev_frame, shot_frame)`.
+4. Wired into `main.py`'s shot-zone-assignment loop as the **primary** zone-position source, falling back to Phase C.1's lunge-apex proxy if TrackNetV3 isn't set up on a given machine — this is a hard anti-hardcoding requirement (Section 7.4): the pipeline must keep working, just less precisely, without an optional heavy third-party dependency.
 
-**Acceptance Criteria:**
-- Shuttle detection rate ≥80% of frames within rallies
-- Shot count accuracy improves to within ±1 of ground truth for ≥80% of rallies
-- Zone accuracy ≥80% compared to ground truth (correct zone or adjacent zone) — an improvement over Phase C's player-position proxy
+**Key finding — raw shot-frame shuttle position is *worse* than the player proxy, not better:** the first, most direct approach (look up the shuttle's (x,y) at the optical-flow-detected shot frame) made front-zone predictions collapse to near-zero — worse than Phase C.1. Root cause: at the detected "shot frame," the shuttle is typically still airborne, so its pixel-Y reflects height above the court, not depth along the court. The fix was re-framing the question: "zone (receive by)" means where the shuttle was *when the receiving player hit it*, i.e. the shuttle's lowest point (closest to the court surface) during its descent **between** the previous shot and this one — not at any single fixed frame. Searching for that local maximum, with a small (5-frame) pad after the previous shot to skip contact-blur noise, is what actually worked. Full sweep and mechanism explanation in `docs/RESULTS.md` ("Phase D").
+
+**Result (video 1, full pipeline, vs. Phase C.1):**
+
+| Metric | Phase C.1 (player proxy) | Phase D (real shuttle) |
+|---|---|---|
+| Zone exact match | 13.2% | 13.2% (no change) |
+| Zone exact-or-adjacent | 60.4% | 60.4% (no change) |
+| Column distribution divergence vs ground truth | 0.19 | **0.04** (left/right axis effectively solved) |
+| Row distribution divergence vs ground truth | 0.60 | 0.53 (improved, not solved) |
+
+**Honest read:** the acceptance criterion below ("zone accuracy ≥80% correct-or-adjacent") was **not met** — adjacent-match stayed at 60.4%, identical to Phase C.1 at this sample size (n=53). The real, validated win is distributional: the horizontal (left/right) axis is now very close to ground truth, and front-zone representation moved from badly under-predicted (15% vs 45% true, Phase C.1) to much closer (36% vs 45% true). The vertical axis still isn't fully solved — "back" is now under-predicted where Phase C.1 over-predicted "mid," a smaller-magnitude version of the same front/back difficulty, now likely from the landing-point search window blurring together long-clear descents and short-drop descents. This is a real, mechanistically-understood limitation to iterate on further, not a result to overstate.
+
+**Acceptance criteria status:**
+- Shuttle detection rate ≥80% of frames within rallies — **not met** (77.3% on video 1), but close, and the gap is genuine occlusion/off-screen frames, not a tracking defect.
+- Shot count accuracy within ±1 of ground truth for ≥80% of rallies — unaffected by this phase (shot detection still uses Phase C's optical flow; out of scope here).
+- Zone accuracy ≥80% correct-or-adjacent — **not met** (60.4%, unchanged from Phase C.1). Distributional accuracy improved substantially; exact/adjacent match rate did not.
+
+**Video 2 generalization check:** initial diagnosis (subprocess disappeared, free memory had been observed as low as ~255MB) was OS-level memory exhaustion — **wrong**. Root cause was a path-separator bug in `ensure_ball_predictions()` (the vendored `predict.py` does a Unix-style filename split that silently breaks `--save_dir` on Windows backslash paths); TrackNetV3 had actually completed successfully, with its csv landing in `input/` instead of the expected cache directory. Fixed, and the recovered real shuttle data exposed a second, genuine finding: `zone_for()`'s proportional-grid clamping collapses real shuttle landing points into the back row when their Y range falls outside the player-foot-derived calibration bounds (median shuttle Y 134 vs. calibration `top=176`) — a gap a player-position proxy can never expose, since the proxy's own positions are what the calibration was built from. Full writeup, including the now-superseded earlier (incorrect) fallback numbers: `docs/RESULTS.md` "Phase D" → "Video 2".
 
 **Research References:**
 | Paper | Contribution |
@@ -598,3 +611,8 @@ A second, un-annotated test video `Badminton_video_example_2.mp4` was added to `
 | 2026-06-27 | Implemented court-line homography (Phase C.1) but disabled it by default for zone mapping | Fixed a real bug in `detect_court_corners` (minAreaRect was destroying the court's trapezoid shape) and validated the resulting homography is geometrically correct — but empirically, using it to map *player foot position* made zone prediction worse (front-zone predictions collapsed to ~0%) due to a known monocular-camera parallax limitation, not an implementation error. Kept the code (useful for Phase D, mapping real shuttle position) but off by default for the current proxy use. |
 | 2026-06-27 | Adopted lunge-apex windowing (±12 frames) as the default zone-estimation method | Swept 0–16 frame windows against ground truth; nearly doubled exact-zone accuracy (7.5%→13.2%) and substantially fixed the horizontal-axis distribution collapse. Vertical axis improved only slightly — accepted as a known, mechanistically-explained limitation of pixel-space player-position proxying (see Phase C.1), not chased further with more parameter tuning. |
 | 2026-06-27 | Treating Phase C.1's plateau as a signal to prioritize Phase D (TrackNet) next, rather than further player-position-proxy tuning | Two independent refinements (court-line homography, lunge-apex windowing) each hit the same wall on the front/back axis for the same underlying reason — player position is not shuttle position. Further tuning of the proxy is expected to keep hitting this ceiling. |
+| 2026-06-29 | Rejected raw "shuttle position at the detected shot frame" as the Phase D zone signal; replaced with a landing-point search between consecutive shots | Tested first since it was the most direct approach — it made front-zone predictions collapse to near-zero, worse than Phase C.1. The shuttle is still airborne (mid-flight height, not court depth) at the optical-flow-detected shot frame. Searching for the shuttle's local lowest point strictly between the previous shot and this one is a different, correct signal for "where the receiver actually received it." |
+| 2026-06-29 | Kept `shuttle_tracker.py` falling back to Phase C.1's lunge-apex proxy when TrackNetV3 isn't set up on a machine, rather than making TrackNetV3 a hard dependency | Anti-hardcoding requirement (Section 7.4) extends to optional heavy dependencies, not just constants: the pipeline must keep producing output, just less precisely, if the ~140MB external model isn't installed. |
+| 2026-06-29 | Did not claim Phase D met its ≥80% zone exact-or-adjacent acceptance criterion | Adjacent-match stayed at 60.4%, identical to Phase C.1 at n=53 — a real, validated improvement in error *distribution* (column divergence 0.19→0.04) is not the same claim as meeting the accuracy bar, and reporting it as such would be the kind of overstatement Section 7.4 was written to prevent. |
+| 2026-06-30 | Corrected an initial wrong diagnosis: video 2's TrackNetV3 "failure" was not memory exhaustion — it was a path-separator bug in `ensure_ball_predictions()` | The vendored `predict.py` extracts the video filename via a Unix-style `split('/')`, which is a no-op on a Windows backslash path and causes its own `os.path.join(save_dir, video_name)` to silently discard `save_dir`. TrackNetV3 had actually completed successfully; the csv landed in `input/` instead of `data/shuttle_cache/`, so `ensure_ball_predictions()` correctly saw no file at the expected path and returned `None`, triggering the fallback exactly as designed — just for the wrong underlying reason. The observed memory pressure during the run was real but coincidental, not the cause. Fixed by normalizing the path to forward slashes before passing it to the script. The lesson: a fallback firing "correctly" doesn't mean the assumed cause was correct — verify the actual failure before writing it down. |
+| 2026-06-30 | Found (via video 2's real shuttle data, after the path-bug fix) that `zone_for()`'s proportional-grid clamping can collapse real shuttle landing points into the back row, and documented it as a genuine limitation rather than re-clamping further | Video 2's calibration bounds (`top=176`) are correctly derived from observed player foot positions, but the real shuttle's landing points have a lower median Y (134) than that — a player-position proxy can never expose this gap because the proxy's own positions are what the calibration was built from. The earlier "plausible-looking" video 2 fallback result is superseded: it looked fine because the proxy was incapable of triggering this clamping, not because the calibration was actually adequate. |

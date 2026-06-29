@@ -213,12 +213,87 @@ Window=12 frames (~0.4s each side) was chosen as the best balance of exact accur
 
 ---
 
+## Phase D: Real Shuttle Tracking via TrackNetV3 (2026-06-29)
+
+**Motivation:** Phase C.1's honest read was that the player-position proxy has a structural ceiling — pixel-space "how far did the player reach" is a poor stand-in for "where did the shuttle actually land," especially front/back. The fix proposed there was to stop proxying and track the real shuttle.
+
+**Method:** [TrackNetV3](https://github.com/qaz812345/TrackNetV3) (qaz812345), a pretrained temporal CNN (seq_len=8, `bg_mode='concat'`) doing per-frame heatmap regression for shuttlecock (x, y, visibility). Used as-is, no fine-tuning — it's trained on BWF-style broadcast footage already, which is what both project videos are. Run via `--eval_mode nonoverlap` (sliding_step=seq_len, ~8x fewer forward passes than the default overlapping-window ensemble mode) since this machine is CPU-only; ~52 minutes for video 1's 2689 frames.
+
+**Visual validation:** spot-checked 6 frames against the source video before trusting the output at all — e.g. frame 1673 showed the shuttle correctly isolated mid-flight near the top of frame; frame 1043 showed it correctly at a lunging player's racket. Overall visibility rate 77.3% (the rest is the shuttle off-screen, occluded by a player, or genuinely too motion-blurred — not a tracking failure mode unique to this video).
+
+### Finding 1: raw shuttle position *at* the shot frame is worse than the player proxy
+
+The first, most direct approach — look up the shuttle's (x, y) at the optical-flow-detected shot frame, map it through the existing calibration — was tested first and was **worse** than Phase C.1's lunge-apex proxy on every distributional metric (front-zone predictions collapsed to near-zero, the opposite-but-equally-wrong failure mode from Phase C). Root cause: at the moment optical flow detects a "shot," the shuttle is typically still airborne mid-flight, so its pixel-Y reflects height above the court, not depth along the court — exactly the kind of confound a player's foot position doesn't have.
+
+### Finding 2: the shuttle's local ground-contact point, searched *between* consecutive shots, is the fix
+
+Re-framed the question: "zone (receive by)" means where the shuttle was *when the receiving player hit it*, which is the shuttle's lowest point (largest pixel-Y, closest to the court surface) during its descent from the previous shot, before the next player intercepts it. Searching for that local Y-maximum strictly between the previous shot's frame and the current shot's frame is a meaningfully different signal than the contact-frame lookup in Finding 1.
+
+Swept a `pad_frames` parameter (frames to skip immediately after the previous shot, since the shuttle is still near the previous player's racket then, not descending):
+
+| pad (frames) | Exact | Adjacent | Row divergence | Col divergence |
+|:---:|:---:|:---:|:---:|:---:|
+| 0 | 15.4% | 67.3% | 0.62 | 0.04 |
+| **5 (chosen)** | **13.5%** | **63.5%** | **0.50** | **0.04** |
+| 8 | 13.7% | 62.7% | 0.51 | 0.08 |
+| 12 | 12.0% | 62.0% | 0.52 | 0.04 |
+| 20 | 14.0% | 62.0% | 0.60 | 0.16 |
+
+`pad=5` was chosen over `pad=0` despite a slightly lower exact/adjacent figure because it has the best row divergence (0.50, vs 0.62 at pad=0) without giving up the col-divergence win — `pad=0` was let through a small amount of contact-blur noise from the previous shot that `pad=5` filters out. Larger pads start re-picking up the *next* exchange's bounce instead of this one's.
+
+### Full pipeline result, video 1
+
+Wired into the actual pipeline (`src/pipeline/shuttle_tracker.py`, called from `main.py`) rather than left as an offline script — `ShuttleTracker.landing_point()` replaces the player-proxy lookup as the primary source, falling back to Phase C.1's lunge-apex if TrackNetV3 isn't set up on a given machine (anti-hardcoding requirement: the pipeline must still run, just less accurately, without this optional heavy dependency).
+
+| Metric | Phase C.1 (player proxy) | Phase D (real shuttle) |
+|---|---|---|
+| Zone exact match | 13.2% | 13.2% |
+| Zone exact-or-adjacent | 60.4% | 60.4% |
+| Row distribution (back/mid/front) | 43% / 42% / 15% | 17% / 47% / 36% |
+| Col distribution (left/center/right) | 42% / 30% / 28% | 40% / 24.5% / 35.8% |
+| Ground truth row (back/mid/front) | 34% / 21% / 45% | 34% / 21% / 45% |
+| Ground truth col (left/center/right) | 38% / 25% / 38% | 38% / 25% / 38% |
+| Row divergence | 0.60 | 0.53 |
+| Col divergence | 0.19 | **0.04** |
+| `receive by` accuracy | 88.7% | 88.7% (unchanged — shuttle position doesn't affect this) |
+
+**Honest read:** exact-match and adjacent-match percentages happened to land on the same numbers as Phase C.1 — coincidence at this sample size (n=53), not evidence of no change; the underlying error *shape* changed substantially. Column distribution is now very close to ground truth (0.04 divergence, vs 0.19) — the left/right axis is essentially solved. Row distribution improved (0.60 → 0.53) and front-zone representation is now far closer to the true shape (36% predicted vs 45% true, vs Phase C.1's 15% vs 45%) — but "back" is now *under*-predicted (17% vs 34% true) where Phase C.1 over-predicted "mid." This is a different, smaller-magnitude version of the same vertical-axis difficulty flagged in Phase C.1, now likely coming from a different source: the `pad_frames` search window can blur together "shuttle still descending from a high clear" with "shuttle landing from a short drop shot" in a way a single scalar pad can't fully disambiguate. Treated as the next concrete target if further iteration on this axis is wanted, not as a blocker — the column-axis fix alone is a real, validated improvement.
+
+### Video 2 (no ground truth — generalization check)
+
+Ran the same unmodified pipeline on video 2 (854×480, 176.6s — nearly 2x video 1's length).
+
+**A real integration bug was found and fixed here, and the first read of this run was wrong — worth recording both, not just the corrected answer.** TrackNetV3's subprocess for video 2 ran for ~75 minutes and then disappeared from the process list. Free system memory had been observed dipping as low as ~255MB during the run, so the first conclusion was "OS-level out-of-memory kill" — plausible, and `main.py`'s fallback engaged exactly as designed (printed `"TrackNetV3 unavailable... falling back to player-position proxy"`, completed normally with plausible-looking output). **That conclusion was wrong.** TrackNetV3 had actually completed successfully; its output csv just landed in the wrong folder. The cause: `predict.py` extracts the video's filename via `video_file.split('/')[-1]` — a Unix-style split that's a no-op against a Windows backslash path, and `os.path.join(save_dir, video_name)` then silently *discards* `save_dir` entirely once `video_name` itself looks like an absolute path (Python's `os.path.join` semantics: an absolute-looking later argument wins). The prediction csv was sitting in `input/`, not `data/shuttle_cache/`, the whole time the fallback was "explaining" its absence. Fixed in `shuttle_tracker.py` by normalizing the path argument to forward slashes before passing it to the vendored script (`str(video_path.resolve()).replace("\\", "/")` — see commit). Recovered the already-complete prediction file, re-ran the pipeline (now a ~1 minute run, no TrackNet re-inference needed), and got the real result below.
+
+**The real result exposed a second, more interesting problem — and this one was hiding behind the proxy the whole time, not introduced by Phase D:**
+
+| Check | Result |
+|---|---|
+| Total shots | 82 across 6 rallies: `[16, 14, 16, 5, 10, 21]` (shot *detection* is untouched by Phase D; only zone mapping differs from the earlier, now-superseded fallback run) |
+| `receive by` balance | 42 / 40 — balanced alternation |
+| Zone distribution (real shuttle) | `{1:6, 2:32, 3:16, 5:6, 6:20, 8:1, 9:1}` — collapsed into zones 1/2/3/6, almost nothing in 4/7/8/9 |
+| Row distribution (real shuttle) | back 65.9% / mid 31.7% / **front 2.4%** |
+| Col distribution (real shuttle) | left 7.3% / center 47.6% / right 45.1% |
+| (for contrast) Row/col distribution via the player-proxy fallback that ran first | back 37.8% / mid 40.2% / front 22.0%; left 31.7% / center 40.2% / right 28.0% — looked far more plausible, but for the wrong reason (see below) |
+
+**Root cause:** `court_calibration.zone_for()`'s proportional-grid fallback *clamps* `x`/`y` into `[0, 1]` before computing row/column (`court_calibration.py` lines ~75, ~81, ~87) — by design, since a player's foot position can wander slightly outside the sampled calibration range and should still snap to the nearest edge zone rather than error out. Video 2's calibration bounds (`top=176, bottom=480, left=54, right=667`, from 156 player-foot samples) are — correctly — derived from where players' *feet* were observed standing. But the real shuttle's landing-point Y values have a median of 134, *below* `top=176`: the shuttle legitimately travels into screen space no player's feet ever occupied (deep clears landing near the true baseline, on a camera framing where the baseline sits above where the calibration sampled players standing). Every one of those points clamps to `rel=0` → the back row, every time. A player-position proxy can never expose this, because the proxy's positions are *definitionally* inside the calibration's range — they're what the calibration was built from. The real shuttle has no such guarantee, and video 2's camera framing was different enough from video 1's that the gap became large enough to matter (video 1's `top=91` happened to leave enough headroom that this didn't show up there).
+
+**Honest read:** this is a real, newly-discovered limitation, not a regression — Phase D didn't create this gap, it revealed it. The fix isn't more clamping; it's widening the calibration's bounds using the observed shuttle position range (once available) in addition to player foot positions, or biasing `margin_frac` upward specifically on the side the shuttle, not the players, defines. Not yet implemented — flagged as the concrete next step for whoever continues this, alongside the now-fixed path bug. The earlier "plausible-looking" fallback result for video 2 is superseded and should not be cited as evidence Phase D works well on video 2; it was the proxy quietly avoiding a calibration problem that the real shuttle data was the first thing to actually expose.
+
+### Key Parameters (Phase D)
+- TrackNetV3 inference mode: `nonoverlap` (CPU-feasible; ~52 min for video 1's 90s, ~75 min for video 2's 177s)
+- Video file path passed to the vendored `predict.py` must use forward slashes even on Windows — the script's own filename-extraction logic is Unix-style and silently breaks `--save_dir` otherwise (see video 2 finding above)
+- Shuttle landing-point pad: 5 frames after the previous shot
+- Fallback: lunge-apex (Phase C.1) when TrackNetV3 predictions are unavailable (validated under real failure conditions, not just code review)
+
+---
+
 ## Git History
 
 | Commit | Description |
 |--------|-------------|
-| *(uncommitted)* | Phase C.1: court-corner detection fix, homography (validated, off by default), lunge-apex windowing |
-| *(uncommitted)* | Phase C: YOLO player tracking, adaptive calibration, removed hardcoded ratios/name-fallback/first-receiver table |
+| *(uncommitted)* | Phase D: TrackNetV3 real shuttle tracking, `shuttle_tracker.py`, wired into `main.py` with player-proxy fallback |
+| `12d7a6e` | Phase C/C.1: YOLO player tracking, adaptive court calibration, lunge-apex zone estimation |
 | `5c342c1` | Phase B tuning: adjust intro skip to 6s |
 | `512a54b` | Phase B: Shot-level detection within rallies |
 | `6251c5a` | Phase A: Scoreboard-driven rally segmentation |
@@ -234,14 +309,16 @@ Window=12 frames (~0.4s each side) was chosen as the best balance of exact accur
 - `src/pipeline/player_detector.py` — YOLO person detection (Phase C) + `find_lunge_apex` windowed position search (Phase C.1)
 - `src/pipeline/court_detector.py` — Court corner detection (fixed in C.1) + homography (Phase C.1, available, off by default)
 - `src/pipeline/court_calibration.py` — Adaptive court bounds/net line + zone mapping, homography-aware (Phase C/C.1)
-- `src/pipeline/shot_detector.py` — Optical flow shot detection with adaptive per-rally threshold + scene-cut guard + lunge-apex zone estimation
+- `src/pipeline/shot_detector.py` — Optical flow shot detection with adaptive per-rally threshold + scene-cut guard + lunge-apex zone estimation (fallback)
+- `src/pipeline/shuttle_tracker.py` — TrackNetV3 wrapper: generates/caches per-video shuttle predictions, finds each shot's landing point (Phase D)
 - `src/pipeline/export.py` — CSV output generation
 
 ### Entry Point
 - `src/main.py` — CLI orchestrator (6-step pipeline)
 
 ### Superseded / now-dead code
-- `src/pipeline/zone_mapper.py`, `src/pipeline/player_tracker.py`, `src/pipeline/shuttle_tracker.py` — no longer imported by `main.py` as of Phase C. Candidates for deletion in a follow-up cleanup pass.
+- `src/pipeline/zone_mapper.py`, `src/pipeline/player_tracker.py` — no longer imported by `main.py` as of Phase C. Candidates for deletion in a follow-up cleanup pass.
+- `src/pipeline/shuttle_tracker.py`'s original blob-detection implementation was replaced outright in Phase D (same filename, new contents) — it was never imported by `main.py`, so there was no dead code to carry forward.
 
 ---
 
@@ -252,4 +329,4 @@ Window=12 frames (~0.4s each side) was chosen as the best balance of exact accur
 
 ---
 
-*Last updated: 2026-06-27*
+*Last updated: 2026-06-29*

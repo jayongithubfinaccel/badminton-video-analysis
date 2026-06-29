@@ -55,3 +55,18 @@ SCOREBOARD_CONFIRMATION_FRAMES = 3  # Require N consistent readings to confirm s
 # Player 1 = far court (top of frame), Player 2 = near court (bottom of frame).
 PLAYER1_NAME_FALLBACK = "Player 1"
 PLAYER2_NAME_FALLBACK = "Player 2"
+
+# Shuttle tracking (Phase D) — TrackNetV3 is an external model with its own
+# large checkpoint weights; it lives as a sibling clone, not inside this repo.
+# If it isn't present on a given machine, ensure_ball_predictions() returns
+# None and callers fall back to the player-position proxy (Phase C.1).
+TRACKNETV3_DIR = PROJECT_ROOT.parent / "TrackNetV3_src"
+TRACKNETV3_TRACKNET_CKPT = TRACKNETV3_DIR / "ckpts" / "TrackNet_best.pt"
+TRACKNETV3_INPAINTNET_CKPT = TRACKNETV3_DIR / "ckpts" / "InpaintNet_best.pt"
+SHUTTLE_CACHE_DIR = PROJECT_ROOT / "data" / "shuttle_cache"
+
+# Frames to skip immediately after the previous shot before searching for
+# this shot's landing point. The shuttle is still near the previous player's
+# racket right after contact, which is noise, not the landing point we want.
+# Chosen via sweep against ground truth (docs/RESULTS.md "Phase D").
+SHUTTLE_LANDING_PAD_FRAMES = 5

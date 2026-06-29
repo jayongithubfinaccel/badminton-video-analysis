@@ -26,6 +26,7 @@ from src.pipeline.export import generate_per_shot_output, generate_rally_output
 from src.pipeline.rally_segmenter import Rally, RallySegmenter
 from src.pipeline.scoreboard_ocr import ScoreboardOCR
 from src.pipeline.shot_detector import Shot, ShotDetector
+from src.pipeline.shuttle_tracker import ShuttleTracker, ensure_ball_predictions
 from src.pipeline.validator import ValidationError, validate_video
 
 # Lunge-apex search window (each side, in frames @ ~30fps => ~0.4s). Chosen by
@@ -220,6 +221,17 @@ class AnalysisPipeline:
             calibration=calibration,
         )
 
+        print("       Checking for TrackNetV3 shuttle predictions...")
+        ball_csv = ensure_ball_predictions(self.video_path)
+        shuttle_tracker = ShuttleTracker(ball_csv) if ball_csv else None
+        if shuttle_tracker:
+            print(f"       Using real shuttle positions from {ball_csv.name}")
+        else:
+            print(
+                "       TrackNetV3 unavailable on this machine — "
+                "falling back to player-position proxy (lunge-apex)"
+            )
+
         all_shots: list[Shot] = []
         global_shot_number = 1
         previous_winner = 0  # winner of the prior rally serves the next one
@@ -261,9 +273,13 @@ class AnalysisPipeline:
                 window_before = min(LUNGE_APEX_WINDOW_FRAMES, (shot.frame_idx - prev_frame) // 2)
                 window_after = min(LUNGE_APEX_WINDOW_FRAMES, (next_frame - shot.frame_idx) // 2)
 
-                pos = detector.estimate_shuttle_position_apex(
-                    self.cap, shot.frame_idx, shot.receive_by, window_before, window_after
-                )
+                pos = None
+                if shuttle_tracker:
+                    pos = shuttle_tracker.landing_point(prev_frame, shot.frame_idx)
+                if pos is None:
+                    pos = detector.estimate_shuttle_position_apex(
+                        self.cap, shot.frame_idx, shot.receive_by, window_before, window_after
+                    )
                 if pos:
                     shot.shuttle_x, shot.shuttle_y = pos
                     _half, zone = calibration.zone_for(pos[0], pos[1])

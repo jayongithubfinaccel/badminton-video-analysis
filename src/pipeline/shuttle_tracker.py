@@ -1,173 +1,108 @@
-"""Shuttle tracking — detect and track the shuttlecock in each frame.
+"""Shuttle position tracking via TrackNetV3 (Phase D).
 
-Uses background subtraction and blob detection to find the bright white
-shuttlecock against the court surface.
+TrackNetV3 (qaz812345/TrackNetV3) predicts per-frame shuttlecock (x, y,
+visibility) from raw video using a pretrained model — no fine-tuning needed.
+This module is the pipeline's interface to those predictions: it locates (or
+generates) the per-video prediction CSV, and turns the raw per-frame points
+into landing-point estimates usable for zone mapping.
+
+TrackNetV3 itself is not vendored into this repo — it's a large third-party
+model with its own checkpoint weights (~140MB), set up as a sibling clone
+(see docs/PRD_v2.3.md Phase D). If it isn't present on a given machine,
+predictions are simply unavailable and callers fall back to the
+player-position proxy (shot_detector.estimate_shuttle_position_apex).
+
+Supersedes the earlier blob-detection-based shuttle tracker (background
+subtraction + brightness/size filtering), which was never wired into the
+pipeline and consistently lost the shuttle against bright court surfaces
+and broadcast overlays.
 """
 
-import cv2
-import numpy as np
+import csv
+import sys
+from pathlib import Path
 
 from src.config import (
-    SHUTTLE_BRIGHTNESS_THRESHOLD,
-    SHUTTLE_MAX_AREA,
-    SHUTTLE_MIN_AREA,
+    SHUTTLE_CACHE_DIR,
+    SHUTTLE_LANDING_PAD_FRAMES,
+    TRACKNETV3_DIR,
+    TRACKNETV3_INPAINTNET_CKPT,
+    TRACKNETV3_TRACKNET_CKPT,
 )
 
 
-class ShuttlePosition:
-    """A detected shuttle position in a single frame."""
+def ensure_ball_predictions(video_path: Path) -> Path | None:
+    """Return the path to this video's shuttle-prediction CSV, generating it
+    via TrackNetV3 if not already cached. Returns None if TrackNetV3 isn't
+    set up on this machine.
+    """
+    import subprocess
 
-    def __init__(self, x: int, y: int, frame_idx: int, confidence: float):
-        self.x = x
-        self.y = y
-        self.frame_idx = frame_idx
-        self.confidence = confidence
+    SHUTTLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cached = SHUTTLE_CACHE_DIR / f"{video_path.stem}_ball.csv"
+    if cached.exists():
+        return cached
 
-    def __repr__(self) -> str:
-        return f"ShuttlePos(x={self.x}, y={self.y}, frame={self.frame_idx}, conf={self.confidence:.2f})"
+    predict_script = TRACKNETV3_DIR / "predict.py"
+    if not predict_script.exists() or not TRACKNETV3_TRACKNET_CKPT.exists():
+        return None
+
+    # predict.py extracts the video's stem via `video_file.split('/')[-1]` —
+    # a Unix-style split that's a no-op on a Windows backslash path, which
+    # then makes its os.path.join(save_dir, video_name) silently discard
+    # save_dir entirely (os.path.join drops everything before an operand
+    # that looks like an absolute path). Forward slashes parse correctly on
+    # Windows too, so normalizing here avoids touching the vendored script.
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(predict_script),
+            "--video_file", str(video_path.resolve()).replace("\\", "/"),
+            "--tracknet_file", str(TRACKNETV3_TRACKNET_CKPT.resolve()).replace("\\", "/"),
+            "--inpaintnet_file", str(TRACKNETV3_INPAINTNET_CKPT.resolve()).replace("\\", "/"),
+            "--save_dir", str(SHUTTLE_CACHE_DIR.resolve()).replace("\\", "/"),
+            "--eval_mode", "nonoverlap",
+        ],
+        cwd=str(TRACKNETV3_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"       WARNING: TrackNetV3 prediction failed: {result.stderr[-500:]}")
+        return None
+
+    return cached if cached.exists() else None
 
 
 class ShuttleTracker:
-    """Track shuttlecock position across frames using blob detection."""
+    """Looks up real shuttle positions from a TrackNetV3 prediction CSV."""
 
-    def __init__(self):
-        self.positions: list[ShuttlePosition] = []
-        self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=30, varThreshold=50, detectShadows=False
-        )
-        self._prev_position: ShuttlePosition | None = None
+    def __init__(self, csv_path: Path, pad_frames: int = SHUTTLE_LANDING_PAD_FRAMES):
+        self._lookup: dict[int, tuple[float, float]] = {}
+        with open(csv_path, newline="") as f:
+            for row in csv.DictReader(f):
+                if int(row["Visibility"]) == 1:
+                    self._lookup[int(row["Frame"])] = (float(row["X"]), float(row["Y"]))
+        self.pad_frames = pad_frames
 
-    def detect_shuttle(
-        self,
-        frame: np.ndarray,
-        frame_idx: int,
-        court_mask: np.ndarray | None = None,
-    ) -> ShuttlePosition | None:
-        """Detect shuttlecock in a single frame.
+    def landing_point(self, prev_frame: int, shot_frame: int) -> tuple[float, float] | None:
+        """Estimate where the shuttle was received for the shot at shot_frame.
 
-        Strategy:
-        1. Background subtraction to find moving objects
-        2. Filter by brightness (shuttle is white/bright)
-        3. Filter by size (shuttle is small)
-        4. Use proximity to previous position for continuity
+        Searches for the shuttle's lowest on-screen point (largest pixel Y =
+        closest to the court surface) between the previous shot and this one,
+        skipping `pad_frames` right after the previous contact — the shuttle
+        is still near the previous player's racket then, not descending
+        toward its landing point. Chosen empirically; see docs/RESULTS.md
+        "Phase D".
         """
-        h, w = frame.shape[:2]
+        f_start = prev_frame + self.pad_frames
+        f_end = shot_frame
+        if f_end <= f_start:
+            f_start = max(prev_frame, shot_frame - 10)
 
-        # Background subtraction
-        fg_mask = self._bg_subtractor.apply(frame)
-
-        # Convert to grayscale for brightness check
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Find bright regions (shuttle is white)
-        _, bright_mask = cv2.threshold(gray, SHUTTLE_BRIGHTNESS_THRESHOLD, 255, cv2.THRESH_BINARY)
-
-        # Combine: moving AND bright
-        combined = cv2.bitwise_and(fg_mask, bright_mask)
-
-        # Apply court mask if available (only look within court area)
-        if court_mask is not None:
-            combined = cv2.bitwise_and(combined, court_mask)
-
-        # Morphological cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-
-        # Find contours
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Filter candidates by size
-        candidates = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if SHUTTLE_MIN_AREA <= area <= SHUTTLE_MAX_AREA:
-                M = cv2.moments(contour)
-                if M["m00"] > 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-
-                    # Confidence based on brightness and size
-                    brightness = gray[cy, cx] / 255.0
-                    size_score = 1.0 - abs(area - 50) / SHUTTLE_MAX_AREA
-                    confidence = (brightness + size_score) / 2.0
-
-                    candidates.append(ShuttlePosition(cx, cy, frame_idx, confidence))
-
-        if not candidates:
-            return None
-
-        # Select best candidate
-        best = self._select_best_candidate(candidates)
-        if best is not None:
-            self.positions.append(best)
-            self._prev_position = best
-
+        best = None
+        for f in range(f_start, f_end + 1):
+            point = self._lookup.get(f)
+            if point is not None and (best is None or point[1] > best[1]):
+                best = point
         return best
-
-    def _select_best_candidate(self, candidates: list[ShuttlePosition]) -> ShuttlePosition | None:
-        """Select the most likely shuttle from candidates.
-
-        Uses proximity to previous detection and confidence score.
-        """
-        if not candidates:
-            return None
-
-        if self._prev_position is None:
-            # No previous — pick highest confidence
-            return max(candidates, key=lambda c: c.confidence)
-
-        # Score each candidate based on proximity to previous + confidence
-        scored = []
-        for c in candidates:
-            dist = np.sqrt(
-                (c.x - self._prev_position.x) ** 2 +
-                (c.y - self._prev_position.y) ** 2
-            )
-            # Normalize distance (closer is better), max reasonable jump ~200px
-            proximity_score = max(0, 1.0 - dist / 200.0)
-            total_score = 0.4 * c.confidence + 0.6 * proximity_score
-            scored.append((c, total_score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[0][0] if scored[0][1] > 0.2 else None
-
-    def get_landing_positions(self) -> list[ShuttlePosition]:
-        """Detect likely landing positions (where shuttle changes direction or stops).
-
-        A landing is detected when the shuttle's vertical velocity reverses
-        (going down then up = bounce/land).
-        """
-        if len(self.positions) < 3:
-            return self.positions
-
-        landings = []
-        for i in range(1, len(self.positions) - 1):
-            prev_p = self.positions[i - 1]
-            curr_p = self.positions[i]
-            next_p = self.positions[i + 1]
-
-            # Check for direction change in y (vertical)
-            dy_before = curr_p.y - prev_p.y
-            dy_after = next_p.y - curr_p.y
-
-            # Landing: was going down (dy>0 in image coords), now going up or stopped
-            if dy_before > 2 and dy_after < -2:
-                landings.append(curr_p)
-
-            # Also detect when shuttle suddenly disappears then reappears far away
-            frame_gap = next_p.frame_idx - curr_p.frame_idx
-            if frame_gap > 5:
-                landings.append(curr_p)
-
-        # If no landings detected, use positions at regular intervals
-        if not landings and self.positions:
-            step = max(1, len(self.positions) // 6)
-            landings = self.positions[::step]
-
-        return landings
-
-    def reset(self) -> None:
-        """Reset tracker for a new rally."""
-        self.positions = []
-        self._prev_position = None
