@@ -42,6 +42,9 @@ output/
 # Data exports (keep sample data)
 data/exports/
 
+# Model weights (large binaries, exceed GitHub's 100MB limit; downloaded separately)
+data/models/
+
 # Coverage
 htmlcov/
 .coverage

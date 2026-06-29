@@ -47,8 +47,11 @@ SCOREBOARD_REGION = {
 SCOREBOARD_SAMPLE_INTERVAL = 1.0  # Sample scoreboard every 1.0 seconds (Phase A)
 SCOREBOARD_CONFIRMATION_FRAMES = 3  # Require N consistent readings to confirm score change
 
-# Player names (fallback if OCR cannot detect)
-# Player 1 = far court (top of frame) = first listed in BWF broadcast
-# Player 2 = near court (bottom of frame) = second listed
-PLAYER1_NAME_FALLBACK = "DONG T.Y."
-PLAYER2_NAME_FALLBACK = "FARHAN"
+# Player names (fallback if OCR cannot detect).
+# Must stay generic — never a specific tournament's real player names.
+# A real name belongs to one video; silently reusing it for a different
+# video produced wrong output and is what this fallback exists to prevent
+# (see docs/PRD_v2.3.md Section 7.4 and 14.3).
+# Player 1 = far court (top of frame), Player 2 = near court (bottom of frame).
+PLAYER1_NAME_FALLBACK = "Player 1"
+PLAYER2_NAME_FALLBACK = "Player 2"

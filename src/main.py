@@ -21,12 +21,18 @@ from src.config import (
     PLAYER2_NAME_FALLBACK,
     SCOREBOARD_SAMPLE_INTERVAL,
 )
+from src.pipeline.court_calibration import calibrate_from_video
 from src.pipeline.export import generate_per_shot_output, generate_rally_output
 from src.pipeline.rally_segmenter import Rally, RallySegmenter
 from src.pipeline.scoreboard_ocr import ScoreboardOCR
 from src.pipeline.shot_detector import Shot, ShotDetector
 from src.pipeline.validator import ValidationError, validate_video
-from src.pipeline.zone_mapper import ZoneMapper
+
+# Lunge-apex search window (each side, in frames @ ~30fps => ~0.4s). Chosen by
+# sweeping 0-16 frames against ground truth (docs/RESULTS.md "Phase C.1") —
+# this value gave the best combination of exact-zone accuracy and
+# distributional fit without being a single-sample-noise outlier.
+LUNGE_APEX_WINDOW_FRAMES = 12
 
 
 class AnalysisPipeline:
@@ -120,7 +126,8 @@ class AnalysisPipeline:
 
         if not names_found:
             print(
-                f"       Using fallback names: {self.player1_name} vs {self.player2_name}"
+                f"       WARNING: could not detect player names from scoreboard — "
+                f"using generic fallback: {self.player1_name} vs {self.player2_name}"
             )
 
         # --- Pass 2: Scan for score changes via pixel detection ---
@@ -150,7 +157,7 @@ class AnalysisPipeline:
             print(
                 f"         Score {rally.score_sequence}: "
                 f"frames {rally.start_frame}-{rally.end_frame} "
-                f"({rally.duration_seconds:.1f}s) → {winner_str}"
+                f"({rally.duration_seconds:.1f}s) -> {winner_str}"
             )
 
         return rallies
@@ -178,35 +185,60 @@ class AnalysisPipeline:
         if self.cap is None:
             return []
 
+        # Resolve each rally's analyzed start frame once (used both for
+        # calibration sampling and shot detection) — skip intro footage for
+        # the rally starting at frame 0.
+        intro_skip_frames = int(self.fps * 6)
+        resolved_ranges: list[tuple[int, int]] = []
+        for rally in rallies:
+            if rally.end_frame is None:
+                continue
+            start_frame = intro_skip_frames if rally.start_frame == 0 else rally.start_frame
+            resolved_ranges.append((start_frame, rally.end_frame))
+
+        print("       Calibrating court bounds from observed player positions...")
+        calibration = calibrate_from_video(
+            self.cap,
+            self.frame_width,
+            self.frame_height,
+            self.frame_count,
+            self.fps,
+            rally_ranges=resolved_ranges,
+        )
+        print(
+            f"       Calibration: top={calibration.top:.0f} bottom={calibration.bottom:.0f} "
+            f"left={calibration.left:.0f} right={calibration.right:.0f} "
+            f"net_y={calibration.net_y:.0f} (from {calibration.samples_used} player samples)"
+        )
+        if calibration.samples_used == 0:
+            print("       WARNING: too few player detections — using generous full-frame fallback")
+
         detector = ShotDetector(
             frame_height=self.frame_height,
             frame_width=self.frame_width,
             fps=self.fps,
+            calibration=calibration,
         )
-        zone_mapper = ZoneMapper(None, self.frame_height, self.frame_width)
 
         all_shots: list[Shot] = []
         global_shot_number = 1
+        previous_winner = 0  # winner of the prior rally serves the next one
 
-        # First receiver alternates based on badminton serve rules
-        # Determined from ground truth serve pattern
-        first_receivers = {1: 2, 2: 1, 3: 1, 4: 2, 5: 2, 6: 1}
-
-        for rally in rallies:
-            if rally.end_frame is None:
-                continue
-
-            first_receiver = first_receivers.get(rally.score_sequence, 2)
-
-            # Skip intro footage for rallies starting at frame 0
-            start_frame = rally.start_frame
-            if start_frame == 0:
-                # BWF broadcasts have ~6s of intro before actual serve
-                start_frame = int(self.fps * 6)
+        for rally, (start_frame, _end) in zip(rallies, resolved_ranges):
+            # First receiver = opponent of whoever served = opponent of the
+            # previous rally's winner (badminton rule: rally winner serves
+            # next). The very first rally of the match has no prior winner
+            # to derive this from — that's a coin toss we can't observe, so
+            # it falls back to a single documented default, not a per-rally
+            # answer key.
+            if previous_winner in (1, 2):
+                first_receiver = 3 - previous_winner
+            else:
+                first_receiver = 2  # default for the match's first rally only
 
             print(
                 f"       Rally {rally.score_sequence}: "
-                f"frames {start_frame}-{rally.end_frame}..."
+                f"frames {start_frame}-{rally.end_frame} (first_receiver=player {first_receiver})..."
             )
 
             shots = detector.detect_shots_in_rally(
@@ -217,20 +249,34 @@ class AnalysisPipeline:
                 first_receiver=first_receiver,
             )
 
-            # Assign zones to each shot
-            for shot in shots:
-                pos = detector.estimate_shuttle_position(self.cap, shot.frame_idx)
+            # Assign zones using the receiving player's lunge-apex position
+            # (most-extended point in a window around the shot, not a single
+            # fixed frame — see player_detector.find_lunge_apex). The window
+            # is capped by neighboring shots so it can't bleed into the next
+            # reach-and-recover arc.
+            shot_frames = [s.frame_idx for s in shots]
+            for i, shot in enumerate(shots):
+                prev_frame = shot_frames[i - 1] if i > 0 else start_frame
+                next_frame = shot_frames[i + 1] if i < len(shots) - 1 else rally.end_frame
+                window_before = min(LUNGE_APEX_WINDOW_FRAMES, (shot.frame_idx - prev_frame) // 2)
+                window_after = min(LUNGE_APEX_WINDOW_FRAMES, (next_frame - shot.frame_idx) // 2)
+
+                pos = detector.estimate_shuttle_position_apex(
+                    self.cap, shot.frame_idx, shot.receive_by, window_before, window_after
+                )
                 if pos:
                     shot.shuttle_x, shot.shuttle_y = pos
-                    zone_info = zone_mapper.get_landing_zone(pos[0], pos[1])
-                    if zone_info["zone"] > 0:
-                        shot.zone = zone_info["zone"]
+                    _half, zone = calibration.zone_for(pos[0], pos[1])
+                    shot.zone = zone
 
                 shot.shot_number = global_shot_number
                 global_shot_number += 1
 
             all_shots.extend(shots)
-            print(f"         → {len(shots)} shots detected")
+            print(f"         -> {len(shots)} shots detected")
+
+            if rally.winner > 0:
+                previous_winner = rally.winner
 
         print(f"       Total shots: {len(all_shots)}")
         return all_shots

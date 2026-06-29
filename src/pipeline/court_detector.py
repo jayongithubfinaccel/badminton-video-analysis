@@ -78,22 +78,17 @@ def detect_court_corners(frame: np.ndarray) -> np.ndarray | None:
     if area < (h * w * 0.1):
         return None
 
-    # Approximate to polygon
-    epsilon = 0.02 * cv2.arcLength(largest, True)
-    approx = cv2.approxPolyDP(largest, epsilon, True)
+    # Use the convex hull's own extreme points, NOT a minAreaRect fit.
+    # minAreaRect always returns an axis-aligned rectangle, which destroys
+    # the actual trapezoid shape a perspective camera sees (the far baseline
+    # is narrower than the near baseline). Taking the 4 extreme points of the
+    # hull directly (by x+y and x-y) preserves that trapezoid, which is
+    # exactly what compute_homography() below needs to be meaningful.
+    hull = cv2.convexHull(largest).reshape(-1, 2).astype(np.float32)
+    if len(hull) < 4:
+        return None
 
-    # Try to get 4 corners
-    if len(approx) >= 4:
-        # Use convex hull and find extreme points
-        hull = cv2.convexHull(largest)
-        rect = cv2.minAreaRect(hull)
-        box = cv2.boxPoints(rect)
-        box = np.int32(box)
-
-        # Order points: top-left, top-right, bottom-right, bottom-left
-        return order_points(box.astype(np.float32))
-
-    return None
+    return order_points(hull)
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -220,3 +215,64 @@ def court_coords_to_zone(
     # Zone = row*3 + col + 1
     zone = row * 3 + col + 1
     return zone
+
+
+def zone_from_court_coords(x: float, y: float) -> tuple[str, int]:
+    """Map real-world court coordinates to (half, zone), determining the half
+    automatically from y instead of requiring the caller to already know it.
+    """
+    half = "top" if y < COURT_LENGTH / 2 else "bottom"
+    return half, court_coords_to_zone(x, y, half)
+
+
+def calibrate_homography(
+    cap: cv2.VideoCapture,
+    fps: float,
+    total_frames: int,
+    sample_stride_sec: float = 1.0,
+    rally_ranges: list[tuple[int, int]] | None = None,
+    min_valid_samples: int = 8,
+) -> tuple[np.ndarray | None, int]:
+    """Sample frames, detect the court quadrilateral in each, and compute one
+    stable per-video homography from the median of valid detections.
+
+    Returns (homography_or_None, num_valid_samples). Callers should treat a
+    None homography (or a low sample count) as "detection unreliable for this
+    video" and fall back to the player-position-derived calibration instead
+    — this is a validated enhancement, not a forced replacement.
+    """
+    stride = max(1, int(fps * sample_stride_sec))
+    ranges = rally_ranges if rally_ranges else [(0, total_frames)]
+
+    valid_corners: list[np.ndarray] = []
+    for start, end in ranges:
+        for frame_idx in range(start, min(end, total_frames), stride):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            corners = detect_court_corners(frame)
+            if corners is None:
+                continue
+
+            tl, tr, br, bl = corners
+            top_w = float(np.linalg.norm(tr - tl))
+            bot_w = float(np.linalg.norm(br - bl))
+            # Sanity check, not a per-video tuned value: this camera setup is
+            # elevated behind one baseline, so the near (bottom) edge must be
+            # at least as wide as the far (top) edge. A detection that
+            # violates this is almost certainly a misdetection (e.g. ad
+            # boards, a replay frame), not a different valid camera angle.
+            if bot_w < top_w:
+                continue
+
+            valid_corners.append(corners)
+
+    if len(valid_corners) < min_valid_samples:
+        return None, len(valid_corners)
+
+    stacked = np.stack(valid_corners, axis=0)  # (N, 4, 2)
+    median_corners = np.median(stacked, axis=0).astype(np.float32)
+
+    homography = compute_homography(median_corners)
+    return homography, len(valid_corners)
