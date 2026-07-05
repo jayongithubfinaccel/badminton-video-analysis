@@ -8,7 +8,7 @@ collapsed, implausible zone distribution the moment the camera framing or
 resolution changed (see docs/PRD_v2.3.md, Section 14.3).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -235,4 +235,126 @@ def calibrate_from_video(
         near_home=near_home,
         homography=homography,
         homography_samples=hom_samples,
+    )
+
+
+def recalibrate_from_shuttle_positions(
+    calibration: CourtCalibration,
+    shots_with_real_shuttle_pos: list[tuple[int, float, float]],
+    lo_percentile: float = 5.0,
+    hi_percentile: float = 95.0,
+    margin_frac: float = 0.10,
+    alpha: float = 1.0,
+) -> CourtCalibration:
+    """Second-pass calibration fix: re-derive top/bottom/net_y from real
+    shuttle-landing Y values instead of the player-foot-derived values
+    `calibrate_from_video` produces (necessarily) before any shot exists.
+
+    Rationale (docs/PRD_v2.3.md, 2026-06-30 decision log; confirmed in
+    docs/RESULTS.md Phase D "Root cause"): a standing player's feet during
+    calibration sampling don't reach as far toward the baseline as the
+    shuttle itself does — video 2's calibration measured `top=176` from
+    player positions, while the real shuttle's landing Y median was 134,
+    outside that box, which then clamped every deep shot toward the back
+    row. Once real shuttle positions exist (post shot-detection, from
+    `ShuttleTracker.landing_point`), this lets a second pass fix the row
+    axis using that more direct signal.
+
+    Only top/bottom/net_y change. left/right are deliberately left
+    untouched — the proportional grid's column axis was already close to
+    ground truth (Phase D: 0.04 divergence) and this is a row-axis-only
+    fix; widening left/right here as well was not tested and is not
+    implied by the evidence that motivated this function.
+
+    Args:
+        calibration: the original player-foot-derived calibration (as
+            returned by calibrate_from_video).
+        shots_with_real_shuttle_pos: (receive_by, x, y) tuples, one per
+            shot, for shots where `ShuttleTracker.landing_point()` itself
+            returned a non-None position — i.e. the real TrackNetV3 shuttle
+            signal, NOT a shot that fell back to the player-position
+            lunge-apex proxy (mixing the two back in would reintroduce the
+            exact bias this function exists to correct). receive_by: 1 =
+            far/top half, 2 = near/bottom half (matches
+            CourtCalibration.home_for's convention). x is accepted for
+            caller convenience but unused — only Y feeds the row axis.
+        lo_percentile / hi_percentile: outlier-trimming percentile pair
+            applied to the real shuttle Y values, analogous to
+            `calibrate_from_video`'s 5th/95th on player positions.
+        margin_frac: buffer pushed outward from the percentile bounds, as a
+            fraction of `frame_height` — same convention as
+            `calibrate_from_video`'s `margin_frac` (applied there to
+            player-foot bounds; here to shuttle-derived bounds instead).
+        alpha: blend factor between the shuttle-derived bounds and the
+            original player-foot bounds already on `calibration`.
+            `final = alpha * shuttle_derived + (1 - alpha) * original`.
+            alpha=1.0 uses the shuttle-derived bounds outright; alpha=0.0
+            reproduces the original calibration unchanged.
+
+    Defaults (lo/hi=5/95, margin_frac=0.10, alpha=1.0) are the result of a
+    parameter sweep against video 1 ground truth (n=53 shots, matched by
+    (rally, position-within-rally); see docs/RESULTS.md "Court Calibration
+    Variants" for the fuller history). Starting from the plain "Variant A"
+    anchor (5/95, margin=0, alpha=1.0: zone exact 20.8%, exact-or-adjacent
+    58.5%, row divergence 0.377, col divergence 0.038 — an improvement over
+    the shipped baseline's 13.2% / 60.4% / 0.528 / 0.038 on every axis
+    except exact-or-adjacent), varying margin_frac alone from 0 up to 0.16
+    surfaced a local optimum at 0.10: exact-or-adjacent 64.2% (clears and
+    exceeds the baseline's 60.4%) with row divergence 0.340 — better than
+    both the baseline (0.528) *and* the Variant A anchor (0.377) — and
+    column divergence unchanged at 0.038 (left/right are never touched by
+    this function). Sweeping the percentile pair (2/98, 10/90, 15/85) and
+    the alpha blend (0.25-0.9) around this margin did not beat it: tighter
+    or wider percentiles traded row divergence for adjacent-% or vice versa
+    without clearing both bars simultaneously the way margin=0.10 does, and
+    alpha<1.0 blends consistently hurt row divergence for no adjacent-%
+    gain. Pushing margin_frac further (0.12-0.16) buys a higher raw
+    exact-or-adjacent (up to 67.9% at 0.12-0.14) but row divergence
+    degrades past the Variant A anchor's 0.377 (0.415-0.491) — a real
+    trade-off, not a strict improvement, so the smaller margin=0.10 point
+    was kept as the default since it improves BOTH metrics over Variant A
+    rather than trading one for the other. Zone-exact itself (17.0%) sits
+    between baseline (13.2%) and the Variant A anchor (20.8%) — a partial
+    give-back that was accepted for the adjacent/divergence gains, per this
+    project's house style of not overstating results (docs/PRD_v2.3.md
+    decision log). Checked for plausibility (no ground truth) on video 2:
+    row distribution back/mid/front = 21.5/39.2/39.2 vs the Variant A
+    anchor's 46.8/17.7/35.4 and the baseline's 68.4/29.1/2.5 — the
+    front-zone fix Variant A achieved (front was nearly erased at 2.5% in
+    the baseline) is preserved and slightly extended (39.2%), though the
+    larger margin further redistributes back-row mass into mid on this
+    video specifically; flagged here rather than hidden, since there's no
+    video 2 ground truth to confirm which back/mid split is more correct.
+
+    Returns a NEW CourtCalibration (via dataclasses.replace) with
+    top/bottom/net_y adjusted and homography cleared — this is a pure
+    proportional-grid variant, evaluated standalone against ground truth
+    (see docs/RESULTS.md "Court Calibration Variants"). Falls back to
+    returning the original calibration unchanged if there aren't enough
+    real-shuttle samples on both halves to compute stable percentiles
+    (mirrors calibrate_from_video's own too-few-samples fallback posture).
+    """
+    far_y = [y for receive_by, _x, y in shots_with_real_shuttle_pos if receive_by == 1]
+    near_y = [y for receive_by, _x, y in shots_with_real_shuttle_pos if receive_by == 2]
+
+    if len(far_y) < 5 or len(near_y) < 5:
+        return calibration
+
+    margin_y = calibration.frame_height * margin_frac
+
+    shuttle_top = float(np.percentile(far_y, lo_percentile)) - margin_y
+    shuttle_bottom = float(np.percentile(near_y, hi_percentile)) + margin_y
+    far_hi = float(np.percentile(far_y, hi_percentile))
+    near_lo = float(np.percentile(near_y, lo_percentile))
+    shuttle_net_y = (far_hi + near_lo) / 2.0
+
+    new_top = alpha * shuttle_top + (1 - alpha) * calibration.top
+    new_bottom = alpha * shuttle_bottom + (1 - alpha) * calibration.bottom
+    new_net_y = alpha * shuttle_net_y + (1 - alpha) * calibration.net_y
+
+    new_top = max(0.0, new_top)
+    new_bottom = min(float(calibration.frame_height), new_bottom)
+
+    return replace(
+        calibration, top=new_top, bottom=new_bottom, net_y=new_net_y, homography=None
     )

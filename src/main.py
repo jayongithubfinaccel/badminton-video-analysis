@@ -21,7 +21,10 @@ from src.config import (
     PLAYER2_NAME_FALLBACK,
     SCOREBOARD_SAMPLE_INTERVAL,
 )
-from src.pipeline.court_calibration import calibrate_from_video
+from src.pipeline.court_calibration import (
+    calibrate_from_video,
+    recalibrate_from_shuttle_positions,
+)
 from src.pipeline.export import generate_per_shot_output, generate_rally_output
 from src.pipeline.rally_segmenter import Rally, RallySegmenter
 from src.pipeline.scoreboard_ocr import ScoreboardOCR
@@ -233,6 +236,8 @@ class AnalysisPipeline:
             )
 
         all_shots: list[Shot] = []
+        shots_with_position: list[Shot] = []
+        real_shuttle_samples: list[tuple[int, float, float]] = []
         global_shot_number = 1
         previous_winner = 0  # winner of the prior rally serves the next one
 
@@ -274,8 +279,10 @@ class AnalysisPipeline:
                 window_after = min(LUNGE_APEX_WINDOW_FRAMES, (next_frame - shot.frame_idx) // 2)
 
                 pos = None
+                is_real_shuttle = False
                 if shuttle_tracker:
                     pos = shuttle_tracker.landing_point(prev_frame, shot.frame_idx)
+                    is_real_shuttle = pos is not None
                 if pos is None:
                     pos = detector.estimate_shuttle_position_apex(
                         self.cap, shot.frame_idx, shot.receive_by, window_before, window_after
@@ -284,6 +291,11 @@ class AnalysisPipeline:
                     shot.shuttle_x, shot.shuttle_y = pos
                     _half, zone = calibration.zone_for(pos[0], pos[1])
                     shot.zone = zone
+                    shots_with_position.append(shot)
+                    if is_real_shuttle:
+                        real_shuttle_samples.append(
+                            (shot.receive_by, float(pos[0]), float(pos[1]))
+                        )
 
                 shot.shot_number = global_shot_number
                 global_shot_number += 1
@@ -293,6 +305,30 @@ class AnalysisPipeline:
 
             if rally.winner > 0:
                 previous_winner = rally.winner
+
+        # Second pass: the calibration above derives top/bottom/net_y from
+        # player FEET, which don't reach as far toward the baseline as the
+        # shuttle itself does — visually confirmed to place the back-row
+        # boundary just a few pixels from the real baseline, off the actual
+        # court surface (see docs/RESULTS.md "Court Calibration Variants").
+        # Now that real shuttle landing positions exist, recompute the row
+        # bounds from those directly and re-map every shot's zone through
+        # the corrected calibration.
+        recalibrated = recalibrate_from_shuttle_positions(calibration, real_shuttle_samples)
+        if recalibrated is not calibration:
+            print(
+                f"       Recalibrated row bounds from {len(real_shuttle_samples)} real "
+                f"shuttle positions: top={recalibrated.top:.0f} bottom={recalibrated.bottom:.0f} "
+                f"net_y={recalibrated.net_y:.0f}"
+            )
+            for shot in shots_with_position:
+                _half, zone = recalibrated.zone_for(shot.shuttle_x, shot.shuttle_y)
+                shot.zone = zone
+        else:
+            print(
+                "       Too few real shuttle positions to recalibrate row bounds — "
+                "keeping player-position calibration"
+            )
 
         print(f"       Total shots: {len(all_shots)}")
         return all_shots
