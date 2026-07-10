@@ -8,6 +8,7 @@ Phase B: Per-shot tracking within rallies.
 - Output: per-shot CSV matching ground truth format
 """
 
+import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,9 @@ from pathlib import Path
 import cv2
 
 from src.config import (
+    DEBUG_FRAMES_FOLDER,
+    DEBUG_VIDEO_FOLDER,
+    DEFAULT_DEBUG_FRAME_SAMPLE_COUNT,
     INPUT_FOLDER,
     OUTPUT_FOLDER,
     PLAYER1_NAME_FALLBACK,
@@ -22,10 +26,14 @@ from src.config import (
     SCOREBOARD_SAMPLE_INTERVAL,
 )
 from src.pipeline.court_calibration import (
+    CourtCalibration,
     calibrate_from_video,
     recalibrate_from_shuttle_positions,
 )
+from src.pipeline.debug_overlay import draw_overlays
 from src.pipeline.export import generate_per_shot_output, generate_rally_output
+from src.pipeline.frame_sampler import sample_frame_indices
+from src.pipeline.player_detector import detect_players, detect_rackets
 from src.pipeline.rally_segmenter import Rally, RallySegmenter
 from src.pipeline.scoreboard_ocr import ScoreboardOCR
 from src.pipeline.shot_detector import Shot, ShotDetector
@@ -46,7 +54,12 @@ class AnalysisPipeline:
     Phase B: Shot-level tracking within each rally.
     """
 
-    def __init__(self, video_path: str | Path):
+    def __init__(
+        self,
+        video_path: str | Path,
+        debug_frames: int | None = None,
+        debug_video: bool = False,
+    ):
         self.video_path = Path(video_path)
         self.cap: cv2.VideoCapture | None = None
         self.fps: float = 30.0
@@ -55,6 +68,16 @@ class AnalysisPipeline:
         self.frame_height: int = 0
         self.player1_name = PLAYER1_NAME_FALLBACK
         self.player2_name = PLAYER2_NAME_FALLBACK
+
+        # Visual debug tooling (Phase F, docs/PRD_v2.4.md) — off unless
+        # explicitly requested. `calibration`/`shuttle_tracker`/
+        # `_resolved_ranges` are populated by _detect_shots() and reused
+        # here so the debug renderer doesn't redo calibration/TrackNetV3 setup.
+        self.debug_frames = debug_frames
+        self.debug_video = debug_video
+        self.calibration: CourtCalibration | None = None
+        self.shuttle_tracker: ShuttleTracker | None = None
+        self._resolved_ranges: list[tuple[int, int]] = []
 
     def run(self) -> Path:
         """Run the full analysis pipeline. Returns path to output file."""
@@ -75,6 +98,10 @@ class AnalysisPipeline:
 
         print("[6/6] Generating per-shot CSV output...")
         output_path = self._generate_output(rallies, all_shots)
+
+        if self.debug_frames or self.debug_video:
+            print("[debug] Rendering visual QA overlays (Phase F)...")
+            self._render_debug_outputs()
 
         if self.cap:
             self.cap.release()
@@ -200,6 +227,8 @@ class AnalysisPipeline:
             start_frame = intro_skip_frames if rally.start_frame == 0 else rally.start_frame
             resolved_ranges.append((start_frame, rally.end_frame))
 
+        self._resolved_ranges = resolved_ranges
+
         print("       Calibrating court bounds from observed player positions...")
         calibration = calibrate_from_video(
             self.cap,
@@ -227,6 +256,7 @@ class AnalysisPipeline:
         print("       Checking for TrackNetV3 shuttle predictions...")
         ball_csv = ensure_ball_predictions(self.video_path)
         shuttle_tracker = ShuttleTracker(ball_csv) if ball_csv else None
+        self.shuttle_tracker = shuttle_tracker
         if shuttle_tracker:
             print(f"       Using real shuttle positions from {ball_csv.name}")
         else:
@@ -330,6 +360,8 @@ class AnalysisPipeline:
                 "keeping player-position calibration"
             )
 
+        self.calibration = recalibrated
+
         print(f"       Total shots: {len(all_shots)}")
         return all_shots
 
@@ -389,19 +421,112 @@ class AnalysisPipeline:
 
         return output
 
+    def _render_debug_outputs(self) -> None:
+        """Visual QA / debug tooling (Phase F, docs/PRD_v2.4.md).
+
+        Diagnostic-only: draws the court grid, player foot markers,
+        best-effort racket boxes, and shuttle position (when TrackNetV3 has
+        data for that frame) onto sampled screenshots and/or a full debug
+        video. Reuses the calibration/shuttle-tracker/rally-range state
+        `_detect_shots` already computed rather than recomputing anything.
+        """
+        if self.cap is None or self.calibration is None:
+            return
+
+        if self.debug_frames:
+            frame_indices = sample_frame_indices(self._resolved_ranges, self.debug_frames)
+            out_dir = DEBUG_FRAMES_FOLDER / self.video_path.stem
+            out_dir.mkdir(parents=True, exist_ok=True)
+            print(f"       Saving {len(frame_indices)} sampled debug frames to {out_dir}")
+            for frame_idx in frame_indices:
+                frame = self._read_frame(frame_idx)
+                if frame is None:
+                    continue
+                annotated = self._annotate_frame(frame, frame_idx)
+                cv2.imwrite(str(out_dir / f"frame_{frame_idx:06d}.png"), annotated)
+
+        if self.debug_video:
+            DEBUG_VIDEO_FOLDER.mkdir(parents=True, exist_ok=True)
+            out_path = DEBUG_VIDEO_FOLDER / f"{self.video_path.stem}_annotated.mp4"
+            print(f"       Rendering annotated debug video to {out_path}")
+            self._render_debug_video(out_path)
+
+    def _read_frame(self, frame_idx: int):
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = self.cap.read()
+        return frame if ret else None
+
+    def _annotate_frame(self, frame, frame_idx: int):
+        players = detect_players(frame)
+        rackets = detect_rackets(frame)
+        shuttle = self.shuttle_tracker.at_frame(frame_idx) if self.shuttle_tracker else None
+        return draw_overlays(frame, self.calibration, players, rackets, shuttle)
+
+    def _render_debug_video(self, out_path: Path) -> None:
+        """Renders only the analyzed rally windows, not the whole video
+        (replays/crowd shots between rallies aren't useful to visually QA
+        and would triple the encoding cost for no diagnostic value).
+        """
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            str(out_path), fourcc, self.fps, (self.frame_width, self.frame_height)
+        )
+        try:
+            for start, end in self._resolved_ranges:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+                frame_idx = start
+                while frame_idx < end:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        break
+                    writer.write(self._annotate_frame(frame, frame_idx))
+                    frame_idx += 1
+        finally:
+            writer.release()
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Badminton video analysis pipeline")
+    parser.add_argument(
+        "video_path", nargs="?",
+        help="Path to input .mp4 (defaults to the first .mp4 found in input/)",
+    )
+    parser.add_argument(
+        "--debug-frames", nargs="?", type=int,
+        const=DEFAULT_DEBUG_FRAME_SAMPLE_COUNT, default=None, metavar="N",
+        help=(
+            "Save N randomly-sampled annotated frame screenshots (court grid, "
+            f"player foot, best-effort racket, shuttle) to {DEBUG_FRAMES_FOLDER}/. "
+            f"Defaults to N={DEFAULT_DEBUG_FRAME_SAMPLE_COUNT} if the flag is given "
+            "with no value. Off by default — diagnostic tooling only "
+            "(docs/PRD_v2.4.md Phase F)."
+        ),
+    )
+    parser.add_argument(
+        "--debug-video", action="store_true",
+        help=(
+            f"Render a full annotated debug video to {DEBUG_VIDEO_FOLDER}/, covering "
+            "the analyzed rally windows. Off by default — diagnostic tooling only "
+            "(docs/PRD_v2.4.md Phase F)."
+        ),
+    )
+    return parser.parse_args(argv)
+
 
 def main() -> None:
     """CLI entry point."""
+    args = _parse_args(sys.argv[1:])
+
     # Determine video path
-    if len(sys.argv) > 1:
-        video_path = Path(sys.argv[1])
+    if args.video_path:
+        video_path = Path(args.video_path)
     else:
         # Look for videos in the input folder
         INPUT_FOLDER.mkdir(parents=True, exist_ok=True)
         videos = list(INPUT_FOLDER.glob("*.mp4"))
         if not videos:
             print(f"No MP4 files found in {INPUT_FOLDER}/")
-            print("Usage: python -m src.main <video_path>")
+            print("Usage: python -m src.main <video_path> [--debug-frames [N]] [--debug-video]")
             print(f"   or: place an MP4 file in the '{INPUT_FOLDER}/' folder")
             sys.exit(1)
         video_path = videos[0]
@@ -412,7 +537,9 @@ def main() -> None:
     OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
 
     try:
-        pipeline = AnalysisPipeline(video_path)
+        pipeline = AnalysisPipeline(
+            video_path, debug_frames=args.debug_frames, debug_video=args.debug_video
+        )
         output_path = pipeline.run()
         print(f"\nAnalysis complete!")
         print(f"Results saved to: {output_path}")

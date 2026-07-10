@@ -91,6 +91,52 @@ available to OpenCV/PyTorch — there is no async work, no queue, no server.
    is re-raised after a message (so a stack trace still surfaces) and exits
    non-zero.
 
+## 1.1 Visual debug tooling (Phase F, docs/PRD_v2.4.md) — diagnostic only, off by default
+
+`AnalysisPipeline` accepts `debug_frames: int | None` and `debug_video: bool`
+(wired to the CLI as `--debug-frames [N]` / `--debug-video`, both `None`/
+`False` unless explicitly passed). When either is set, `run()` calls
+`_render_debug_outputs()` **after** the real `[6/6]` CSV output stage,
+reusing the `CourtCalibration`, `ShuttleTracker`, and resolved rally-frame
+ranges `_detect_shots()` already computed:
+
+- `--debug-frames N` — [frame_sampler.sample_frame_indices](src/pipeline/frame_sampler.py)
+  seed-randomly picks N frame indices from within the analyzed rally
+  windows, then [debug_overlay.draw_overlays](src/pipeline/debug_overlay.py)
+  renders each to a PNG under `output/debug_frames/<video_name>/`.
+- `--debug-video` — renders every frame of the analyzed rally windows (not
+  the whole file — skips between-rally replay/crowd footage) through the
+  same `draw_overlays()` call, written via `cv2.VideoWriter` to
+  `output/debug_video/<video_name>_annotated.mp4`.
+
+`draw_overlays()` draws four things on top of the raw frame:
+1. The 9-zone grid (both halves) plus zone-number labels, computed directly
+   from the `CourtCalibration` bounds being used for real zone mapping.
+2. Player foot markers — `player_detector.detect_players()`, same call
+   already used for calibration/lunge-apex, at no extra inference cost.
+3. Racket boxes — **new**, `player_detector.detect_rackets()`, YOLOv8n's
+   pretrained COCO class 38 ("tennis racket"). See "Racket detection" below.
+4. The shuttle marker — `ShuttleTracker.at_frame()`, a new raw per-frame
+   lookup added alongside the existing shot-specific `landing_point()`.
+
+Both flags cost real runtime only when passed (an extra YOLO racket-class
+inference call per rendered frame, plus video encoding for `--debug-video`)
+— when omitted, `_render_debug_outputs()` is never called at all.
+
+**Racket detection is diagnostic-overlay-only.** It is not consumed by shot
+detection, zone mapping, or outcome logic anywhere in the pipeline — see
+`docs/PRD_v2.4.md` Phase F non-goals. Manual spot-check (2026-07-09,
+`Badminton_video_example.mp4`, default `conf_threshold=0.15`): raw
+detections appeared on roughly 1 in 5 sampled frames (8 hits across 44
+frames sampled every 60 frames), confidence 0.26–0.67. Visual inspection of
+individual hits found a mix — a clear true positive on a held racket during
+a pre-match ceremony shot, and at least one ambiguous/likely-false box near
+a net post during play. This is the expected outcome for an off-the-shelf
+tennis-racket class applied to a visually different, smaller, faster-moving
+object it was never trained on: real signal exists but is sparse and noisy,
+consistent with why this class was scoped as overlay-only rather than a
+scoring input.
+
 ### Code that exists but is *not* on this path
 
 - `src/pipeline/player_tracker.py`, `shuttle_tracker.py`, `score_tracker.py`,

@@ -70,3 +70,11 @@ SHUTTLE_CACHE_DIR = PROJECT_ROOT / "data" / "shuttle_cache"
 # racket right after contact, which is noise, not the landing point we want.
 # Chosen via sweep against ground truth (docs/RESULTS.md "Phase D").
 SHUTTLE_LANDING_PAD_FRAMES = 5
+
+# Visual debug tooling (Phase F, docs/PRD_v2.4.md) — diagnostic only, never
+# consumed by scoring logic. Both --debug-frames/--debug-video are off by
+# default; these constants only take effect when a user explicitly requests
+# one of those flags.
+DEBUG_FRAMES_FOLDER = OUTPUT_FOLDER / "debug_frames"
+DEBUG_VIDEO_FOLDER = OUTPUT_FOLDER / "debug_video"
+DEFAULT_DEBUG_FRAME_SAMPLE_COUNT = 30

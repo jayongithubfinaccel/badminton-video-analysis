@@ -19,6 +19,7 @@ from src.pipeline.court_detector import (
     zone_from_court_coords,
 )
 from src.pipeline.player_detector import detect_players
+from src.pipeline.zone_grid import zone_number
 
 
 @dataclass
@@ -72,23 +73,21 @@ class CourtCalibration:
                 # the proportional grid rather than returning an invalid zone.
 
         col_frac = (x - self.left) / max(1.0, (self.right - self.left))
-        col_frac = max(0.0, min(1.0, col_frac))
-        col = 0 if col_frac < 1 / 3 else (1 if col_frac < 2 / 3 else 2)
 
         if y < self.net_y:
             half = "top"
             span = max(1.0, self.net_y - self.top)
-            rel = max(0.0, min(1.0, (y - self.top) / span))
-            # far player: rel near 0 = baseline (back), rel near 1 = net (front)
-            row = 0 if rel < 1 / 3 else (1 if rel < 2 / 3 else 2)
+            # far player: 0 = baseline (back), 1 = net (front)
+            net_axis_frac = (y - self.top) / span
         else:
             half = "bottom"
             span = max(1.0, self.bottom - self.net_y)
-            rel = max(0.0, min(1.0, (y - self.net_y) / span))
-            # near player: rel near 0 = net (front), rel near 1 = baseline (back)
-            row = 2 if rel < 1 / 3 else (1 if rel < 2 / 3 else 0)
+            # near player: 0 = net (front), 1 = baseline (back) — inverted
+            # relative to the top half so net_axis_frac always means
+            # "0 = this half's own baseline, 1 = net" for zone_number.
+            net_axis_frac = 1.0 - (y - self.net_y) / span
 
-        zone = row * 3 + col + 1
+        zone = zone_number(net_axis_frac, col_frac, half)
         return half, zone
 
 

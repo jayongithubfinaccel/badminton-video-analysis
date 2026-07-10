@@ -7,6 +7,7 @@ a perspective transform to map pixel coordinates to court positions.
 import cv2
 import numpy as np
 
+from src.pipeline.zone_grid import zone_number
 
 # Standard badminton court dimensions (in cm)
 COURT_WIDTH = 610  # singles width
@@ -176,45 +177,22 @@ def court_coords_to_zone(
     if y < half_y_start or y > half_y_end:
         return 0  # Not in this player's half
 
-    # Normalize position within the half (0 to 1)
-    rel_y = (y - half_y_start) / (half_y_end - half_y_start)
+    # net_axis_frac: 0 at this half's own baseline, 1 at the net (see
+    # zone_grid.zone_number). rel_x: raw on-screen-left(0)->right(1)
+    # fraction; zone_number applies the top/bottom mirror internally.
+    if player_half == "bottom":
+        # rel=0 at half_y_start (net), rel=1 at half_y_end (own baseline) —
+        # invert so 0 always means "this half's own baseline".
+        rel_y = (y - half_y_start) / (half_y_end - half_y_start)
+        net_axis_frac = 1.0 - rel_y
+    else:
+        # rel=0 at half_y_start (own baseline/top of frame), rel=1 at
+        # half_y_end (net) — already in the "0=baseline,1=net" orientation.
+        net_axis_frac = (y - half_y_start) / (half_y_end - half_y_start)
+
     rel_x = x / COURT_WIDTH
 
-    # Clamp
-    rel_x = max(0.0, min(1.0, rel_x))
-    rel_y = max(0.0, min(1.0, rel_y))
-
-    # Determine column (left=0, center=1, right=2)
-    if rel_x < 1 / 3:
-        col = 0
-    elif rel_x < 2 / 3:
-        col = 1
-    else:
-        col = 2
-
-    # Determine row based on player perspective
-    if player_half == "bottom":
-        # For bottom player: back is at middle of court (top of their half)
-        # rel_y=0 is near net (middle of court), rel_y=1 is baseline (bottom)
-        if rel_y < 1 / 3:
-            row = 2  # Front (near net) -> zones 7,8,9
-        elif rel_y < 2 / 3:
-            row = 1  # Mid -> zones 4,5,6
-        else:
-            row = 0  # Back (baseline) -> zones 1,2,3
-    else:
-        # For top player: back is at top of frame (baseline)
-        # rel_y=0 is baseline (top), rel_y=1 is near net (middle of court)
-        if rel_y < 1 / 3:
-            row = 0  # Back (baseline) -> zones 1,2,3
-        elif rel_y < 2 / 3:
-            row = 1  # Mid -> zones 4,5,6
-        else:
-            row = 2  # Front (near net) -> zones 7,8,9
-
-    # Zone = row*3 + col + 1
-    zone = row * 3 + col + 1
-    return zone
+    return zone_number(net_axis_frac, rel_x, player_half)
 
 
 def zone_from_court_coords(x: float, y: float) -> tuple[str, int]:

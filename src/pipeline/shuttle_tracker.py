@@ -85,6 +85,14 @@ class ShuttleTracker:
                     self._lookup[int(row["Frame"])] = (float(row["X"]), float(row["Y"]))
         self.pad_frames = pad_frames
 
+    def at_frame(self, frame_idx: int) -> tuple[float, float] | None:
+        """Raw shuttle position TrackNetV3 reported for this exact frame, or
+        None if it wasn't visible. Used by the visual debug overlay (Phase
+        F, docs/PRD_v2.4.md) to mark the shuttle on an arbitrary frame — as
+        opposed to landing_point()'s shot-specific search over a range.
+        """
+        return self._lookup.get(frame_idx)
+
     def landing_point(self, prev_frame: int, shot_frame: int) -> tuple[float, float] | None:
         """Estimate where the shuttle was received for the shot at shot_frame.
 

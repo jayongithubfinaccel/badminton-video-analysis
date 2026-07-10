@@ -18,6 +18,7 @@ import numpy as np
 
 _MODEL_PATH = Path(__file__).parent.parent.parent / "data" / "models" / "yolov8n.pt"
 _PERSON_CLASS = 0
+_RACKET_CLASS = 38  # COCO "tennis racket" — see detect_rackets() docstring
 
 _model = None
 
@@ -85,6 +86,56 @@ def detect_players(frame: np.ndarray, conf_threshold: float = 0.35) -> list[Play
     top_two = candidates[:2]
     top_two.sort(key=lambda b: b.center[1])  # top-to-bottom: far court first
     return top_two
+
+
+@dataclass
+class RacketBox:
+    """A detected racket bounding box in a single frame (Phase F, best-effort)."""
+
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    confidence: float
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0)
+
+
+def detect_rackets(frame: np.ndarray, conf_threshold: float = 0.15) -> list[RacketBox]:
+    """Best-effort racket detection for the visual debug overlay (Phase F).
+
+    Uses YOLOv8n's pretrained COCO class 38 ("tennis racket") — there is no
+    badminton-specific racket model or training data in this project. A
+    badminton racket has a much thinner frame and smaller head than a tennis
+    racket, and is a small, fast-moving object at broadcast camera distance,
+    so recall/precision here is UNVALIDATED (no ground truth exists for
+    racket position). This is why the confidence threshold is deliberately
+    lower than detect_players' 0.35: a stricter threshold would likely
+    suppress the already-scarce true positives along with false ones, and
+    since this signal is diagnostic-overlay-only (never consumed by shot
+    detection, zone mapping, or outcome logic — see docs/PRD_v2.4.md Phase
+    F), a noisier but non-empty overlay is more useful for visual QA than an
+    empty one.
+
+    Returns at most 2 boxes (at most one racket per player), sorted by
+    confidence descending. No attempt is made here to associate a given box
+    with a specific player.
+    """
+    model = _get_model()
+    results = model(frame, classes=[_RACKET_CLASS], verbose=False)[0]
+
+    candidates = []
+    for box in results.boxes:
+        conf = float(box.conf[0])
+        if conf < conf_threshold:
+            continue
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        candidates.append(RacketBox(x1, y1, x2, y2, conf))
+
+    candidates.sort(key=lambda b: b.confidence, reverse=True)
+    return candidates[:2]
 
 
 def find_lunge_apex(
