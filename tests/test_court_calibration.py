@@ -91,10 +91,12 @@ def test_leaves_left_right_and_other_fields_untouched():
     assert result.frame_height == calibration.frame_height
 
 
-def test_clears_homography_on_the_recalibrated_result():
-    """The recalibrated calibration is a pure proportional-grid variant —
-    any homography on the original must not leak through and silently take
-    priority in zone_for().
+def test_preserves_homography_on_the_recalibrated_result():
+    """Homography (when present) must survive the recalibration unchanged —
+    zone_for() tries homography first and only falls through to the
+    proportional grid for off-court points, so this second pass should only
+    tighten that fallback's own bounds, not silently disable the more
+    accurate homography path.
     """
     calibration = make_calibration(homography=np.eye(3), homography_samples=50)
     far_y = list(range(80, 100, 2))
@@ -103,7 +105,9 @@ def test_clears_homography_on_the_recalibrated_result():
 
     result = recalibrate_from_shuttle_positions(calibration, samples)
 
-    assert result.homography is None
+    assert result.homography is not None
+    np.testing.assert_array_equal(result.homography, np.eye(3))
+    assert result.homography_samples == 50
 
 
 def test_alpha_zero_reproduces_original_bounds():

@@ -326,12 +326,18 @@ def recalibrate_from_shuttle_positions(
     video 2 ground truth to confirm which back/mid split is more correct.
 
     Returns a NEW CourtCalibration (via dataclasses.replace) with
-    top/bottom/net_y adjusted and homography cleared — this is a pure
-    proportional-grid variant, evaluated standalone against ground truth
-    (see docs/RESULTS.md "Court Calibration Variants"). Falls back to
-    returning the original calibration unchanged if there aren't enough
-    real-shuttle samples on both halves to compute stable percentiles
-    (mirrors calibrate_from_video's own too-few-samples fallback posture).
+    top/bottom/net_y adjusted; homography (if any) is deliberately
+    preserved, not cleared — zone_for() tries homography first and only
+    falls through to this proportional fallback for points the detected
+    court quadrilateral doesn't cover, so this recalibration should keep
+    improving the fallback's own bounds without disabling the more accurate
+    homography path when it's available (see docs/RESULTS.md "Court
+    Calibration Variants" for the standalone proportional-grid evaluation
+    this function was originally validated against, before homography was
+    layered back on top). Falls back to returning the original calibration
+    unchanged if there aren't enough real-shuttle samples on both halves to
+    compute stable percentiles (mirrors calibrate_from_video's own
+    too-few-samples fallback posture).
     """
     far_y = [y for receive_by, _x, y in shots_with_real_shuttle_pos if receive_by == 1]
     near_y = [y for receive_by, _x, y in shots_with_real_shuttle_pos if receive_by == 2]
@@ -354,6 +360,4 @@ def recalibrate_from_shuttle_positions(
     new_top = max(0.0, new_top)
     new_bottom = min(float(calibration.frame_height), new_bottom)
 
-    return replace(
-        calibration, top=new_top, bottom=new_bottom, net_y=new_net_y, homography=None
-    )
+    return replace(calibration, top=new_top, bottom=new_bottom, net_y=new_net_y)

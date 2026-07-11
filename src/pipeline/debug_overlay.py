@@ -14,10 +14,13 @@ import cv2
 import numpy as np
 
 from src.pipeline.court_calibration import CourtCalibration
+from src.pipeline.court_detector import COURT_LENGTH, COURT_WIDTH
 from src.pipeline.player_detector import PlayerBox, RacketBox
-from src.pipeline.zone_grid import zone_for_bands
+from src.pipeline.zone_grid import BACK_BAND_FRAC, FRONT_BAND_FRAC, zone_for_bands
 
-_GRID_COLOR = (0, 255, 255)  # yellow (BGR)
+_GRID_COLOR = (0, 255, 255)  # yellow (BGR) — proportional pixel-space grid
+_HOMOGRAPHY_GRID_COLOR = (255, 140, 0)  # blue — real bird's-eye grid, so the
+# two coordinate systems are visually distinguishable at a glance
 _FOOT_COLOR = (0, 0, 255)  # red
 _RACKET_COLOR = (255, 0, 255)  # magenta
 _SHUTTLE_COLOR = (0, 255, 0)  # green
@@ -65,7 +68,18 @@ def draw_overlays(
 def _draw_court_grid(frame: np.ndarray, cal: CourtCalibration) -> None:
     """Draw both players' 3x3 zone grids, the net line, and zone number
     labels at each cell's center.
+
+    Uses the real-world homography grid (perspective-correct trapezoid)
+    when a validated homography is present on the calibration — matching
+    what `CourtCalibration.zone_for()` actually uses for zone lookups — and
+    falls back to the proportional pixel-space rectangle otherwise. Drawing
+    the rectangle unconditionally here would silently misrepresent what
+    zone_for() is really doing whenever homography is active.
     """
+    if cal.homography is not None:
+        _draw_homography_grid(frame, cal.homography)
+        return
+
     top, bottom, left, right, net_y = cal.top, cal.bottom, cal.left, cal.right, cal.net_y
 
     cv2.rectangle(frame, (int(left), int(top)), (int(right), int(bottom)), _GRID_COLOR, 2)
@@ -96,4 +110,62 @@ def _draw_court_grid(frame: np.ndarray, cal: CourtCalibration) -> None:
                 cv2.putText(
                     frame, str(zone), (cx - 6, cy + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, _GRID_COLOR, 1, cv2.LINE_AA,
+                )
+
+
+def _draw_homography_grid(frame: np.ndarray, homography: np.ndarray) -> None:
+    """Draw the real-world 3x3-per-half grid on the actual 610x1340cm
+    court (columns equal-thirds, rows at the real BWF short/long service
+    line positions — see zone_grid.py) by inverse-projecting court-plane
+    points back into image pixels.
+
+    Same half/row/column -> zone convention as the proportional grid above
+    (net_axis_band = row index for the top half, 2-row for the bottom half,
+    since the bottom half's own baseline is at the high-y edge) — the two
+    are deliberately kept in lockstep so this is a drop-in visual swap, not
+    a second zone-numbering scheme to maintain.
+    """
+    H_inv = np.linalg.inv(homography)
+
+    def project(pts: list[tuple[float, float]]) -> np.ndarray:
+        arr = np.array([pts], dtype=np.float32)
+        return cv2.perspectiveTransform(arr, H_inv)[0]
+
+    half_len = COURT_LENGTH / 2
+    halves = (("top", 0.0, half_len), ("bottom", half_len, COURT_LENGTH))
+
+    # Ascending net_axis_frac cut points (0 = back/baseline, 1 = net),
+    # using the real BWF service-line fractions rather than equal thirds —
+    # must match zone_grid.zone_number_real exactly, or the drawn lines
+    # would lie about where court_coords_to_zone actually splits the court.
+    band_fracs = (0.0, BACK_BAND_FRAC, FRONT_BAND_FRAC, 1.0)
+
+    for half, y_lo, y_hi in halves:
+        col_edges = [COURT_WIDTH * i / 3 for i in range(4)]
+        # For the "top" half, y_lo is that half's own baseline and y_hi is
+        # the net, so ascending y already matches ascending net_axis_frac —
+        # band_fracs applies directly. For "bottom", y_lo is the net and
+        # y_hi is the baseline (the opposite orientation), so the fractions
+        # must be mirrored — same top/bottom asymmetry zone_for_bands
+        # already applies to zone numbering, just applied here to geometry.
+        praw = band_fracs if half == "top" else tuple(1.0 - f for f in reversed(band_fracs))
+        row_edges = [y_lo + (y_hi - y_lo) * p for p in praw]
+
+        for x in col_edges:
+            p1, p2 = project([(x, y_lo), (x, y_hi)])
+            cv2.line(frame, tuple(p1.astype(int)), tuple(p2.astype(int)), _HOMOGRAPHY_GRID_COLOR, 2)
+        for y in row_edges:
+            p1, p2 = project([(0, y), (COURT_WIDTH, y)])
+            cv2.line(frame, tuple(p1.astype(int)), tuple(p2.astype(int)), _HOMOGRAPHY_GRID_COLOR, 2)
+
+        for row in range(3):
+            net_axis_band = row if half == "top" else (2 - row)
+            for col in range(3):
+                zone = zone_for_bands(net_axis_band, col, half)
+                cx_real = (col_edges[col] + col_edges[col + 1]) / 2
+                cy_real = (row_edges[row] + row_edges[row + 1]) / 2
+                (cx, cy) = project([(cx_real, cy_real)])[0]
+                cv2.putText(
+                    frame, str(zone), (int(cx) - 6, int(cy) + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, _HOMOGRAPHY_GRID_COLOR, 1, cv2.LINE_AA,
                 )

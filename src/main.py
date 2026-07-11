@@ -59,8 +59,10 @@ class AnalysisPipeline:
         video_path: str | Path,
         debug_frames: int | None = None,
         debug_video: bool = False,
+        use_homography: bool = False,
     ):
         self.video_path = Path(video_path)
+        self.use_homography = use_homography
         self.cap: cv2.VideoCapture | None = None
         self.fps: float = 30.0
         self.frame_count: int = 0
@@ -237,6 +239,7 @@ class AnalysisPipeline:
             self.frame_count,
             self.fps,
             rally_ranges=resolved_ranges,
+            use_homography=self.use_homography,
         )
         print(
             f"       Calibration: top={calibration.top:.0f} bottom={calibration.bottom:.0f} "
@@ -510,6 +513,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "(docs/PRD_v2.4.md Phase F)."
         ),
     )
+    parser.add_argument(
+        "--homography", action="store_true",
+        help=(
+            "Use the real court-line homography (bird's-eye, perspective-correct "
+            "zone mapping) as the primary zone coordinate system, falling back to "
+            "the proportional pixel-space grid for points outside the detected "
+            "court quadrilateral. Off by default pending broader validation across "
+            "more videos (see docs/RESULTS.md)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -538,7 +551,10 @@ def main() -> None:
 
     try:
         pipeline = AnalysisPipeline(
-            video_path, debug_frames=args.debug_frames, debug_video=args.debug_video
+            video_path,
+            debug_frames=args.debug_frames,
+            debug_video=args.debug_video,
+            use_homography=args.homography,
         )
         output_path = pipeline.run()
         print(f"\nAnalysis complete!")

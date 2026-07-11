@@ -1,0 +1,286 @@
+# Badminton Video Analysis Service — PRD v2.6
+
+> **Version:** 2.6 — Real-World Court Geometry for the 9-Zone Grid
+> **Status:** Active
+> **Author:** Jayson Fetra
+> **Date:** 10 July 2026
+> **Platform:** Backend Python service (CLI)
+> **Supersedes:** PRD v2.4
+
+---
+
+## 0. What Changed in v2.6
+
+This revision does **not** change the product goals or scored output pipeline shape (Sections 1–5, 7, 8 are unchanged from v2.4 except where explicitly noted below). It adds one new phase — **Phase G: Real-court-geometry zone mapping** — covering four related pieces of work, done in this order:
+
+1. **Validated the homography-based zone mapping, with the proportional grid as a fallback, as the proposed default** (not yet flipped on by default in `main.py` — still opt-in via `--homography` pending broader multi-video validation). This revisits Phase C.1's 2026-06-27 decision to disable homography for zone mapping: that decision was about a *player-foot-position proxy* carrying a monocular height bias into the homography, not about homography's geometric correctness — and it predates Phase D's real shuttle tracking. Re-tested against video 1's ground truth with real shuttle positions: homography roughly halves row/column distributional divergence vs. the shipped proportional grid, at the cost of coverage (a homography-only point can fall outside the detected court quadrilateral) — which the existing-but-previously-disabled fallback path in `CourtCalibration.zone_for()` already covers. Full writeup and numbers: `docs/reports/court_zone_homography_vs_proportional.html`; a real re-run of the pipeline showing the grid, and player/racket/shuttle tracking together: `docs/reports/court_zone_homography_example_video1.html`.
+2. **Replaced equal-thirds row banding with the real BWF short/long service line positions, for the homography path only.** The front-zone (7/8/9) boundary now sits at the short service line (198cm from the net) and the back-zone (1/2/3) boundary at the long service line (76cm from the back boundary) — not at 1/3 and 2/3 of the half-court depth. The proportional pixel-space fallback grid's row axis is deliberately **left as equal-thirds** — its 0–1 range is an observed-player-position box, not true court-plane distance, so imposing exact real-line fractions on it would assert a precision that measurement doesn't have. See `zone_grid.py`'s module docstring for the full reasoning.
+3. **Added white-line-based corner refinement** (`court_detector.refine_corners_with_lines`) to correct the green-playing-surface-derived corners (which can run a little short of, or a little past, the actual painted boundary line) against the real detected white lines, with a conservative, fallback-safe design — see Section 9, Phase G.3.
+4. **Answered "should court-box prediction use a trained model instead of a formula?"** (Section 9, Phase G.4): no, not yet — the "camera angle changes the box proportions" problem this idea was raised to solve is already what homography solves (it's a per-video-fit perspective transform, not a fixed box); a trained keypoint-detection model would only be justified if line-detection-based corner refinement (G.3) proves insufficiently robust across many more videos than the two this project currently has.
+
+None of this is wired into the default (no-flag) pipeline output yet — the CSV output shape and default zone-mapping method (`use_homography=False`) are unchanged. This document proposes flipping the default in a future phase once G.1–G.3 have been validated across more than two videos.
+
+---
+
+## 1. Overview
+
+*(Unchanged from v2.4 — see PRD_v2.4.md Section 1.)*
+
+This is a **backend-only Python service** that automatically analyzes badminton singles match video from broadcast footage and produces **per-shot structured data** — one row for every shuttle exchange in the match. The user places an MP4 video file in an input folder, runs the service, and receives a CSV output file where each row represents a single shot. No frontend. No manual annotation. Fully automated via computer vision.
+
+---
+
+## 2. Problem Statement
+
+*(Unchanged from v2.4.)*
+
+---
+
+## 3. Goals and Non-Goals
+
+*(Unchanged from v2.4, with one addition to 3.1:)*
+
+### 3.1 Goals (addition)
+
+- **Map each shot's landing position to the 9-zone court grid using the court's actual physical geometry** (real BWF service-line positions via homography) where a validated per-video homography exists, falling back to the existing proportional grid otherwise — rather than treating "divide the court into thirds" as correct by construction *(new in v2.6)*.
+
+### 3.2 Non-Goals (v2.6 addition)
+
+- No training or deployment of a dedicated court-keypoint ML model in this phase — see Phase G.4's reasoning for why the formula-based approach is tried first.
+- No change to doubles-vs-singles court width handling — `COURT_WIDTH` remains the doubles width (610cm); this phase only changes the row (net-to-baseline) axis.
+
+---
+
+## 4. Badminton Rules Context
+
+*(Unchanged from v2.4.)*
+
+### 4.5 Court Line Dimensions (new in v2.6)
+
+Standard BWF court dimensions relevant to zone mapping (one player's half, net to back boundary line = 670cm = half of the full 13.4m court length):
+
+| Line | Distance | Measured from |
+|---|---|---|
+| Short service line | 198 cm | the net |
+| Long service line (doubles) | 76 cm | the back boundary line (baseline) |
+
+These fixed physical constants (not per-video tuned values) now define the front/mid/back row-zone boundaries for the homography coordinate path — see Phase G.2.
+
+---
+
+## 5. Input Specifications
+
+*(Unchanged from v2.4.)*
+
+---
+
+## 6. Output Specifications
+
+*(Unchanged from v2.4 except 6.5 below.)*
+
+### 6.5 Zone Definition (9-Zone Court Grid) — updated in v2.6
+
+Zone numbering itself is unchanged (Z1–Z3 back, Z4–Z6 mid, Z7–Z9 front, mirrored columns on the far/top half — see `zone_grid.py`, `badminton_court_9zone.png`). What's new in v2.6 is that **the row-band boundaries are no longer necessarily equal thirds**:
+
+```
+                    BASELINE (back)
+    ┌───┬───┬───┐   ─┐
+    │ 1 │ 2 │ 3 │    │ back band: 76cm (long service line to baseline)
+    ├───┼───┼───┤   ─┤
+    │ 4 │ 5 │ 6 │    │ mid band: 396cm (short service line to long service line)
+    │   │   │   │    │  — the largest band, by a wide margin
+    ├───┼───┼───┤   ─┤
+    │ 7 │ 8 │ 9 │    │ front band: 198cm (net to short service line)
+    └───┴───┴───┘   ─┘
+          NET
+```
+
+- **When a validated per-video homography exists** (`CourtCalibration.homography` is set): row bands use the real BWF line positions above (`zone_grid.zone_number_real`, `court_detector.court_coords_to_zone`). Column bands remain equal-thirds — there is no official line dividing the court width into thirds (only the center line, which splits it in half for serving).
+- **Otherwise** (the proportional pixel-space fallback, fit from observed player positions): both axes remain equal-thirds (`zone_grid.zone_number`), unchanged from v2.4. Applying the real-line fractions to a player-position-derived box would misrepresent that box as true court-plane distance, which it isn't.
+
+---
+
+## 7. Technical Architecture
+
+*(Unchanged from v2.4 except the additions below.)*
+
+### 7.2 Required Capabilities (addition)
+
+| Stage | Capability | Purpose |
+|-------|-----------|---------|
+| 3a. Homography Refinement *(new, v2.6)* | Snap green-surface corner estimates to detected white boundary lines | Correct both overshoot (green threshold bleeding past the true line) and undershoot (green mat running short of it) before computing the homography |
+
+### 7.3 Folder Structure (addition)
+
+```
+badminton-video-analysis/
+├── docs/
+│   ├── PRD_v2.6.md            # this document
+│   └── reports/                # (new, v2.6) saved HTML investigation reports
+│       ├── court_zone_homography_vs_proportional.html
+│       └── court_zone_homography_example_video1.html
+├── src/pipeline/
+│   ├── zone_grid.py            # (updated, v2.6) adds zone_number_real / _row_band_real (BWF lines)
+│   ├── court_detector.py       # (updated, v2.6) adds refine_corners_with_lines; court_coords_to_zone uses zone_number_real
+│   └── debug_overlay.py        # (updated, v2.6) draws the real homography trapezoid (BWF row bands) when a homography is active, not just the proportional rectangle
+├── tests/
+│   └── test_court_detector.py  # (new, v2.6) BWF row-banding + corner-refinement coverage
+```
+
+### 7.4 Generalization & Anti-Hardcoding Requirements (addition)
+
+| Current state | Where | Note |
+|---|---|---|
+| Real BWF service-line distances (198cm, 76cm) are fixed constants | `zone_grid.py` | **Not** a per-video hardcode in the sense Section 7.4 warns against — these are universal physical constants of the sport (same on every court in the world), analogous to `COURT_WIDTH`/`COURT_LENGTH` already in `court_detector.py`. What varies per video is the homography itself (fit from that video's own detected corners), which is what maps these fixed real-world fractions onto that video's specific pixel geometry. |
+| `--homography` CLI flag defaults to off | `main.py` | Deliberately opt-in pending validation across more than the two videos this project currently has (see Phase G.1) — flipping a zone-mapping default based on n=2 videos would repeat the exact mistake Section 7.4 already documents elsewhere in this project's history. |
+
+---
+
+## 8. Configuration
+
+*(Unchanged from v2.4, with one CLI addition:)*
+
+```
+--homography    # opt-in: use real court-line homography (BWF row bands) as
+                 # the primary zone coordinate system, falling back to the
+                 # proportional grid for off-court points. Off by default.
+```
+
+---
+
+## 9. Iteration Plan
+
+*(Phases A–F unchanged from v2.4 — see PRD_v2.4.md.)*
+
+### Phase G — Real-Court-Geometry Zone Mapping (2026-07-10)
+
+**Goal:** Make the 9-zone court grid track the badminton court's actual physical geometry (true perspective, true service-line proportions, true boundary lines) instead of a proportional pixel-space approximation, and decide whether that requires a trained model or can be done with a formula.
+
+#### G.1 — Homography as the primary zone-mapping method, proportional grid as fallback
+
+**Motivation:** Phase C.1 (2026-06-27) disabled homography for zone mapping after finding it made predictions *worse* — but the input signal at the time was a player's foot position used as a shuttle-landing proxy, and the failure mechanism identified was specifically the monocular height bias of mapping a *standing person's* foot through a ground-plane homography. Phase D (2026-06-29) replaced that proxy with real TrackNetV3 shuttle positions, which don't have a person's-height bias — but no one had re-tested homography against the *new* signal. This phase does.
+
+**Method:** Re-ran the full pipeline on video 1 (rally segmentation → shot detection → real TrackNetV3 shuttle positions, unchanged) and scored the same 53 ground-truth-matched shuttle positions three ways:
+
+| Method | Coverage | Exact | Exact-or-adjacent | Row divergence | Col divergence |
+|---|---|---|---|---|---|
+| A — shipped proportional grid (recalibrated) | 100% | 15.1% | 66.0% | 0.340 | 0.226 |
+| B — homography only, no fallback | 85% | 15.6% | 62.2% | **0.178** | **0.178** |
+| C — hybrid (homography, proportional fallback) | 100% | 13.2% | 60.4% | 0.226 | 0.189 |
+
+*(Row/col divergence = sum of absolute differences between predicted and true back/mid/front and left/center/right shot-share distributions; lower is better. Exact/adjacent move within noise at n=53; divergence is the steadier signal.)*
+
+Generalization check on video 2 (no ground truth zones, coverage only): homography-only coverage dropped to 50.6% (vs 85% on video 1) — different camera framing makes corner detection noisier on some videos. The hybrid (Method C) still reaches 100% coverage there, which is why it — not homography-only — is the proposed method.
+
+**Visual validation:** the homography-projected trapezoid grid (`court_detector.detect_court_corners` + `compute_homography`, both already implemented since Phase C.1, just not wired into zone-lookup by default) tracks the real sidelines/net/service lines closely on in-play frames of both videos, matching the two hand-drawn ground-truth grid images almost exactly. See `docs/reports/court_zone_homography_vs_proportional.html` for the side-by-side images, and `docs/reports/court_zone_homography_example_video1.html` for a full pipeline re-run with player/racket/shuttle tracking overlaid on the homography grid.
+
+**Real bug found and fixed as a result of testing this end-to-end:** `recalibrate_from_shuttle_positions()` (the Phase D-followup second calibration pass) unconditionally cleared the homography field on its output. With `--homography` enabled, every shot's zone would have silently reverted to the plain proportional grid immediately after this second pass ran — before a single shot's zone was ever actually looked up through the homography. Fixed to preserve homography (only the fallback bounds are refined by this pass); test updated (`test_preserves_homography_on_the_recalibrated_result`, formerly asserted the opposite).
+
+**Decision:** kept `--homography` opt-in (not the default) — see 7.4's addition above. The debug/diagnostic overlay (`debug_overlay.py`) was fixed to actually draw the homography trapezoid when active (previously it always drew the proportional rectangle regardless), since showing the wrong grid shape would make this feature impossible to visually QA.
+
+#### G.2 — Real BWF service-line row banding (replacing equal thirds)
+
+**Motivation:** raised directly by user feedback reviewing G.1's demo screenshots: the front/mid boundary should sit at "the white line closest to the net" (the short service line) and the mid/back boundary should sit "closer to the white line in the back" (the long service line) — not at arbitrary equal-thirds points that don't correspond to any painted line.
+
+**Method:** Section 4.5's real distances (198cm from net, 76cm from baseline, over a 670cm half-court depth) give two `net_axis_frac` cut points — `FRONT_BAND_FRAC ≈ 0.7045`, `BACK_BAND_FRAC ≈ 0.1134` — used in place of 1/3 and 2/3. This produces asymmetric bands (front 29.5% of depth, mid 59.1%, back 11.3%) instead of equal 33/33/33.
+
+**Scope decision:** applied only to the homography coordinate path (`court_detector.court_coords_to_zone`, via the new `zone_grid.zone_number_real`), **not** the proportional pixel-space fallback (`court_calibration.zone_for`'s non-homography branch, still `zone_grid.zone_number`, unchanged). The fallback's 0–1 range is an empirically observed player-position box, not verified true court-plane distance — asserting exact real-line fractions on it would claim a precision that measurement doesn't have. The column axis stays equal-thirds on both paths — there's no official line splitting the court width into thirds (only the center line, which splits it in half for serving).
+
+**Validation:** `tests/test_zone_grid.py` (new banding-threshold tests, a test confirming the bands are asymmetric and BWF-derived, and a test confirming a point that would classify differently under equal-thirds vs. the real bands actually does); `tests/test_court_detector.py` (new — covers `court_coords_to_zone` at the real line boundaries for both halves). `debug_overlay._draw_homography_grid`'s drawn lines were updated to the same asymmetric fractions so the visual overlay can't drift out of sync with what `zone_for()` actually computes.
+
+#### G.3 — White-line-based corner refinement
+
+**Motivation:** also raised in the same user feedback: the drawn court boundary should be derived from the actual white lines, and shouldn't exceed the real court boundary. Zooming into generated debug frames confirmed a real, visible gap between the homography-projected boundary and the true white sideline on some corners (in the direction of the green mat's own extent running short of the painted line, not the direction of overshoot at those particular corners — both directions are possible depending on the frame, per `court_detector.py`'s corner-detection docstring history).
+
+**Method:** `court_detector.refine_corners_with_lines(frame, corners)` — takes the existing green-mask-derived coarse corners, runs the already-implemented (but previously unused for this) `detect_court_lines()` Hough-segment detector, and for each of the 4 coarse edges: finds Hough segments matching that edge by angle (within 12°) and proximity (within 15% of the edge's own length), fits a single line to their combined endpoints (`cv2.fitLine`), and re-intersects adjacent fitted lines for a boundary-accurate corner. Falls back to the coarse corner (per-edge, or entirely) whenever fewer than 2 of 4 edges get a confident match, or a refined corner would move more than 12% of the quadrilateral's average edge length from the coarse estimate — a bad line match (e.g. snapping to a service line instead of the baseline) degrades to the pre-refinement behavior rather than silently producing something worse.
+
+**Wired into:** `calibrate_homography()`, immediately after `detect_court_corners()` and before the existing `bot_w >= top_w` sanity check (so the sanity check runs on the refined, more accurate corners).
+
+**Validation:** `tests/test_court_detector.py` — a synthetic white-rectangle-on-green frame with the coarse corners deliberately shifted outward by 12px on every edge; refinement recovers a mean corner error under 3px (vs the 12px it started with). Two fallback-safety tests: a blank frame with no lines returns the coarse corners unchanged; a coarse estimate implausibly far from any detected line (simulating a bad upstream detection) is also left unchanged rather than being "corrected" toward a plausible-looking but unverified answer.
+
+**Honest read:** validated on synthetic data with clean, thick, unambiguous lines. Not yet re-validated end-to-end against the two real ground-truth videos' actual corner-detection accuracy (that would need the same visual-overlay + coverage methodology as G.1, repeated with refinement on); flagged as the concrete next step before considering G.3 done, not silently assumed to transfer.
+
+#### G.4 — Should court-box prediction use a trained model instead of a formula?
+
+**Question raised:** "the court boxes length is the same for all courts even though due to camera angle, ideally the court boxes will not have the same length — is it better to use a model to predict the court boxes?"
+
+**Answer: not yet, and probably not first.** Two separate problems were being described together, and they have two different fixes already in this phase:
+
+1. **"Different camera angle should produce different box proportions in pixel space"** — this is exactly what the homography (G.1) already does. The equal-thirds *pixel-space* grid (the proportional fallback) is the one thing that can't adapt to camera angle, by construction — it's a flat proportional split of a bounding box. The homography grid, by contrast, is a per-video-fit perspective transform: the same real-world 198cm/76cm line positions get projected to *different* pixel positions on every video, automatically matching that video's specific camera angle/zoom/framing (confirmed visually in G.1 — the projected trapezoid's proportions visibly differ between video 1 and video 2's generated overlays). No model is needed to solve this specific problem; it was already solved by adopting real-world coordinates as the reference frame, the same reasoning that motivated using homography at all.
+2. **"Court corner/line detection itself is sometimes imprecise"** — this is the real remaining gap (G.3's motivation), and IS a place where a trained model (e.g. a court-keypoint-detection network, analogous to how TrackNetV3 was adopted for the shuttle in Phase D rather than hand-rolling motion heuristics) could plausibly do better than the current color-threshold-plus-Hough-lines approach, especially on courts with unusual lighting, mat colors, or camera framing this project's two test videos haven't exposed. But that's a meaningfully heavier lift than G.3 (requires either a pretrained checkpoint that generalizes to this domain, or training data this project doesn't have) and isn't yet justified by evidence — G.3's classical-CV refinement hasn't even been stress-tested against more than synthetic data yet (see G.3's honest-read note).
+
+**Recommendation:** ship and validate G.1–G.3 first (formula + refined classical CV), across more videos than the two currently available, before investing in a trained keypoint model. Revisit this question specifically if/when corner-detection failure rate (tracked via `calibrate_homography`'s own `num_valid_samples` return value, already logged) proves to be a recurring problem across a wider video sample — that would be the concrete, evidence-based trigger to justify the model-training cost, not a decision to make on n=2 videos.
+
+---
+
+## 10. Acceptance Criteria (Overall)
+
+*(AC-01 through AC-16 unchanged from v2.4 — see PRD_v2.4.md. Addition:)*
+
+| ID | Criterion |
+|----|-----------|
+| AC-17 *(new, v2.6)* | With `--homography` enabled: `CourtCalibration.zone_for()` uses real BWF service-line row bands (not equal thirds) whenever a validated homography is active, and falls back to the equal-thirds proportional grid — never an unclassified/crashing result — for any point outside the detected court quadrilateral. |
+| AC-18 *(new, v2.6)* | `refine_corners_with_lines()` never produces a *worse* (further from the true boundary) quadrilateral than its input coarse corners — enforced by the max-shift-fraction fallback, covered by synthetic tests in `test_court_detector.py`. |
+
+---
+
+## 11. Risks and Mitigations
+
+*(Unchanged from v2.4, with one addition:)*
+
+| Risk | Impact | Mitigation |
+|------|--------|-----------|
+| Homography-only coverage varies a lot by video (85% on video 1, 50.6% on video 2) | A pure homography rollout would silently lose over half of video 2's shots to "no zone" | Hybrid fallback (G.1, already implemented) guarantees 100% coverage on every video regardless of corner-detection reliability for that specific camera framing |
+| White-line corner refinement (G.3) only validated on synthetic data so far | Could look correct in unit tests but not actually improve (or could regress) real-video corner accuracy | Flagged explicitly as the next validation step (G.3 honest-read note) before relying on it; not claimed as validated beyond synthetic coverage |
+
+---
+
+## 12. Success Metrics
+
+*(Phase A–F rows unchanged from v2.4. New row:)*
+
+| Metric | Phase G Target |
+|---|---|
+| Zone row/col distributional divergence (video 1, vs. shipped proportional grid) | Lower on both axes — met: row 0.340→0.178 (homography-only) / 0.226 (hybrid), col 0.226→0.178 (homography-only) / 0.189 (hybrid) |
+| Coverage (fraction of shots a method can classify at all) | 100% for whatever method ships as default — met by the hybrid (Method C); homography-only alone does not meet this (85%/50.6% across the two videos) |
+
+**Current measured state (video 1, n=53, this phase):** see the G.1 table above. Not yet re-measured with G.2 (BWF row banding) and G.3 (corner refinement) layered on top of the G.1 hybrid — that combined re-measurement is the concrete next step before proposing `--homography` become the default.
+
+---
+
+## 13. Open Questions
+
+*(Questions 1–7 unchanged from v2.4. New:)*
+
+| # | Question | Proposed Answer |
+|---|----------|----------------|
+| 8 *(new)* | Should `--homography` become the default (rather than opt-in)? | Not yet — validate G.2 (BWF banding) + G.3 (corner refinement) together, end-to-end, against ground truth on video 1 and a plausibility/coverage check on video 2, the same way G.1 alone was validated. Revisit once that combined number exists. |
+| 9 *(new)* | Is the corner-refinement approach (G.3, classical CV) sufficient long-term, or will it eventually need a trained keypoint model? | Not decided — see G.4. Tracked via `calibrate_homography`'s existing `num_valid_samples` return value; a recurring low-sample-count pattern across many videos would be the concrete trigger to revisit. |
+
+---
+
+## 14. Reference Data
+
+*(14.1–14.3 unchanged from v2.4. Addition:)*
+
+### 14.4 Phase G Reports (new in v2.6)
+
+| Report | Contents |
+|---|---|
+| `docs/reports/court_zone_homography_vs_proportional.html` | Method comparison (homography vs. proportional grid), visual grid-vs-ground-truth comparison on both videos, the G.1 metrics table |
+| `docs/reports/court_zone_homography_example_video1.html` | Full pipeline re-run example: frame screenshots and a video clip showing the homography grid tracking players/racket/shuttle live |
+
+---
+
+## 15. Decision Log
+
+*(Entries through 2026-07-09 unchanged from v2.4. New entries:)*
+
+| Date | Decision | Rationale |
+|------|----------|-----------|
+| 2026-07-10 | Re-tested homography for zone mapping using real TrackNetV3 shuttle positions instead of the player-foot proxy that motivated disabling it in Phase C.1 | The original rejection mechanism (monocular height bias of a standing person's foot) doesn't apply to a shuttle's ground-contact point; the underlying geometry was never re-tested against the corrected signal until now. |
+| 2026-07-10 | Kept the homography+fallback hybrid, not homography alone, as the proposed method | Homography-only coverage varies too much by video (85% / 50.6%) to be safe as a sole method; the already-implemented fallback path gives 100% coverage on both. |
+| 2026-07-10 | Fixed `recalibrate_from_shuttle_positions()` to preserve homography instead of clearing it | With homography enabled, every shot's zone would have silently reverted to the plain proportional grid right after this pass ran, defeating the point of enabling it at all — found by tracing the pipeline end-to-end while building the demo, not by code review alone. |
+| 2026-07-10 | Replaced equal-thirds row banding with real BWF short/long service line fractions, for the homography path only (not the proportional fallback) | User feedback: the front/mid and mid/back boundaries should track actual painted lines, not arbitrary thirds. Scoped to homography only because the proportional fallback's 0–1 range isn't verified true court-plane distance — applying exact line fractions there would be unjustified precision. |
+| 2026-07-10 | Added white-line-based corner refinement (`refine_corners_with_lines`), fallback-safe by design | User feedback: the drawn court boundary should reference the actual white lines and not exceed the real court. Made conservative (falls back per-edge or entirely on low confidence) so it can't make corner accuracy worse than doing nothing. |
+| 2026-07-10 | Decided against training a court-keypoint ML model for now | The specific problem raised ("camera angle should change box proportions") is already solved by adopting homography (a per-video real-world coordinate fit); a trained model would only be justified for the separate problem of corner-detection robustness, which hasn't yet been stress-tested enough (n=2 videos) to justify the cost. |
