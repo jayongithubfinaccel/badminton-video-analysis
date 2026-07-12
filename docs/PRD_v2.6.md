@@ -3,7 +3,7 @@
 > **Version:** 2.6 — Real-World Court Geometry for the 9-Zone Grid
 > **Status:** Active
 > **Author:** Jayson Fetra
-> **Date:** 10 July 2026 (Phase G.5 added 12 July 2026)
+> **Date:** 10 July 2026 (Phase G.5 added 12 July 2026; Phase G.6 ground-truth re-validation added 12 July 2026)
 > **Platform:** Backend Python service (CLI)
 > **Supersedes:** PRD v2.4
 
@@ -238,6 +238,34 @@ This is implemented as an explicit, traceable adjustment in `zone_grid.py` (`_MI
 
 **Honest read:** this is a qualitative adjustment from visual review, not re-validated against video 1's ground-truth CSV numerically — Section 12's divergence/coverage metrics for G.1 predate this change and haven't been re-measured with G.5 applied. That combined re-measurement (G.2 + G.3 + G.5 together, against ground truth) is still the open item from G.1/G.2 (see Section 13, Q8), now slightly larger in scope.
 
+#### G.6 — Combined re-validation against ground truth (2026-07-12): a real trade-off, not a clean win
+
+**Motivation:** Q8/Q10 both asked for exactly this — re-measure the deployed method (G.1 hybrid + G.2 BWF banding + G.3 corner refinement + G.5 back-band adjustment, all together, as `--homography` actually behaves) against video 1's ground-truth CSV, rather than relying on the pre-G.3/G.5 numbers in Section 12.
+
+**Method:** ran the real `AnalysisPipeline` twice (`use_homography=False` and `True`) end-to-end and scored the same 53 ground-truth-matched shots three ways, same methodology as G.1:
+
+| Method | Coverage | Exact | Exact-or-adjacent | Row divergence | Col divergence |
+|---|---|---|---|---|---|
+| A — shipped proportional grid | 100% | 15.1% | 66.0% | 0.340 | 0.226 |
+| B — homography-only, no fallback (refined corners, G.5 bands) | 84.9% | 13.3% | 66.7% | 0.444 | 0.178 |
+| C — `--homography` hybrid, **as actually deployed** | 100% | 11.3% | 64.2% | **0.453** | **0.151** |
+
+Versus the G.1-era hybrid numbers (equal-thirds rows via homography, no corner refinement): exact 13.2%→11.3% (slightly worse), adjacent 60.4%→64.2% (slightly better), **col divergence 0.189→0.151 (better)**, **row divergence 0.226→0.453 (roughly doubled — worse)**.
+
+**Two separate effects, opposite directions:**
+
+1. **Column accuracy genuinely improved** (0.189→0.151), most plausibly from G.3's corner refinement making the homography's left/right mapping more accurate. A clean win with no apparent trade-off.
+2. **Row accuracy got substantially worse.** The actual row distributions explain why:
+
+   | | back | mid | front |
+   |---|---|---|---|
+   | Ground truth | 34.0% | 20.8% | 45.3% |
+   | Method C (now) | 26.4% | 43.4% | 30.2% |
+
+   G.5 made mid (4/5/6) the largest zone by geometric depth (~47% of half-court depth), matching the real service-line proportions. But this match's actual shot placement doesn't distribute that way — real rallies cluster shots near the net and near the baseline, not mid-court (true mid share is only 20.8%). A geometrically larger mid band absorbs more shots that are visually closer to front or back, which is exactly what happened: mid is now over-predicted by more than 2x, pulled from both front and back.
+
+**Honest read:** the back zone looks more visually correct against real footage (which is what motivated G.5), but that same change measurably hurts row-distribution accuracy against this ground truth. This isn't a case of "the code is broken" — exact/adjacent-match are roughly stable — it's a genuine tension between matching the court's real physical markings and matching how shots actually distribute in a real match. Not resolved as of this writing; see Section 13, Q8/Q10 (updated) for the decision still pending.
+
 ---
 
 ## 10. Acceptance Criteria (Overall)
@@ -266,12 +294,12 @@ This is implemented as an explicit, traceable adjustment in `zone_grid.py` (`_MI
 
 *(Phase A–F rows unchanged from v2.4. New row:)*
 
-| Metric | Phase G Target |
-|---|---|
-| Zone row/col distributional divergence (video 1, vs. shipped proportional grid) | Lower on both axes — met: row 0.340→0.178 (homography-only) / 0.226 (hybrid), col 0.226→0.178 (homography-only) / 0.189 (hybrid) |
-| Coverage (fraction of shots a method can classify at all) | 100% for whatever method ships as default — met by the hybrid (Method C); homography-only alone does not meet this (85%/50.6% across the two videos) |
+| Metric | Phase G Target | Status after G.6 combined re-measurement |
+|---|---|---|
+| Zone row/col distributional divergence (video 1, vs. shipped proportional grid) | Lower on both axes | **Partially met.** Col: met (0.226→0.151, hybrid). Row: **not met** — 0.226→0.453 (hybrid), worse than the shipped proportional grid's own 0.340. See G.6. |
+| Coverage (fraction of shots a method can classify at all) | 100% for whatever method ships as default | Met — hybrid (Method C) is 100% on video 1; homography-only alone is not (84.9%/50.6% across the two videos) |
 
-**Current measured state (video 1, n=53, this phase):** see the G.1 table above. Not yet re-measured with G.2 (BWF row banding) and G.3 (corner refinement) layered on top of the G.1 hybrid — that combined re-measurement is the concrete next step before proposing `--homography` become the default.
+**Current measured state (video 1, n=53):** see the G.6 table (supersedes the G.1-only table previously here). The combined G.2+G.3+G.5 re-measurement is done — it reveals a real row-accuracy regression from G.5, not a clean improvement across the board. This is the concrete reason `--homography` remains opt-in (Section 13, Q8) rather than a reason to consider the phase finished.
 
 ---
 
@@ -281,9 +309,9 @@ This is implemented as an explicit, traceable adjustment in `zone_grid.py` (`_MI
 
 | # | Question | Proposed Answer |
 |---|----------|----------------|
-| 8 *(new)* | Should `--homography` become the default (rather than opt-in)? | Not yet — validate G.2 (BWF banding) + G.3 (corner refinement) + G.5 (back-band adjustment) together, end-to-end, against ground truth on video 1 and a plausibility/coverage check on video 2, the same way G.1 alone was validated. Revisit once that combined number exists. |
+| 8 *(updated, G.6)* | Should `--homography` become the default (rather than opt-in)? | **Still no, and now for a sharper reason.** The combined re-measurement (G.6) is done: column accuracy improved (0.189→0.151) but row accuracy regressed (0.226→0.453, worse than even the shipped proportional grid's 0.340). Flipping the default now would trade a real column win for a real row loss — not a decision to make silently. Pending: resolve Q10 (dial back or reconsider G.5) before revisiting this. |
 | 9 *(new)* | Is the corner-refinement approach (G.3, classical CV) sufficient long-term, or will it eventually need a trained keypoint model? | Not decided — see G.4. Tracked via `calibrate_homography`'s existing `num_valid_samples` return value; a recurring low-sample-count pattern across many videos would be the concrete trigger to revisit. |
-| 10 *(new)* | Is the G.5 back-band adjustment (20% mid shrink) the right amount, or just a first pass? | First pass, from one round of visual review on video 1 only. Worth re-checking against video 2's footage and, once the combined ground-truth re-measurement (Q8) exists, seeing whether it moves row divergence in the right direction rather than just "looking right." |
+| 10 *(updated, G.6)* | Is the G.5 back-band adjustment (20% mid shrink) the right amount, or just a first pass? | **Measured, not just a hunch now: it moves row divergence in the wrong direction** (0.226→0.453 vs ground truth) even though it looks more correct visually. Options, not yet decided between: (a) revert G.5 and keep the literal BWF long-service-line boundary, (b) keep G.5 for visual/product reasons and accept the row-accuracy cost, (c) try a smaller shrink than 20% and re-measure. Needs a decision, not further silent tuning. |
 
 ---
 
@@ -313,3 +341,4 @@ This is implemented as an explicit, traceable adjustment in `zone_grid.py` (`_MI
 | 2026-07-10 | Added white-line-based corner refinement (`refine_corners_with_lines`), fallback-safe by design | User feedback: the drawn court boundary should reference the actual white lines and not exceed the real court. Made conservative (falls back per-edge or entirely on low confidence) so it can't make corner accuracy worse than doing nothing. |
 | 2026-07-10 | Decided against training a court-keypoint ML model for now | The specific problem raised ("camera angle should change box proportions") is already solved by adopting homography (a per-video real-world coordinate fit); a trained model would only be justified for the separate problem of corner-detection robustness, which hasn't yet been stress-tested enough (n=2 videos) to justify the cost. |
 | 2026-07-12 | Shrunk the mid band 20% and gave that depth to the back band (`BACK_BAND_FRAC` ≈0.1134 → ≈0.2316), leaving front unchanged | User visual review of deployed G.1–G.3 output on real frames: the literal 76cm long-service-line back band read as too shallow for "deep court" placement; front looked correct as-is. Scoped to the homography path only, same reasoning as G.2. Not yet re-validated against ground-truth metrics — qualitative visual call, flagged as such (Q10). |
+| 2026-07-12 | Ran the combined G.2+G.3+G.5 re-measurement against ground truth (G.6) — found a real row-divergence regression (0.226→0.453), not a clean win | Q10's visual call was correct about *looking* more like real footage, but wrong about improving row-distribution accuracy against this match's actual shot placement (which clusters front/back, not mid-court, unlike the geometrically-larger mid band G.5 produces). Column accuracy did genuinely improve (0.189→0.151), most likely from G.3's corner refinement. Left `--homography` opt-in and G.5 code unchanged pending an explicit decision on the trade-off (Q8/Q10 updated) — not silently reverted or kept. |
