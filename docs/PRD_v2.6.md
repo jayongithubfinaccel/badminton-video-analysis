@@ -3,7 +3,7 @@
 > **Version:** 2.6 — Real-World Court Geometry for the 9-Zone Grid
 > **Status:** Active
 > **Author:** Jayson Fetra
-> **Date:** 10 July 2026
+> **Date:** 10 July 2026 (Phase G.5 added 12 July 2026)
 > **Platform:** Backend Python service (CLI)
 > **Supersedes:** PRD v2.4
 
@@ -17,8 +17,9 @@ This revision does **not** change the product goals or scored output pipeline sh
 2. **Replaced equal-thirds row banding with the real BWF short/long service line positions, for the homography path only.** The front-zone (7/8/9) boundary now sits at the short service line (198cm from the net) and the back-zone (1/2/3) boundary at the long service line (76cm from the back boundary) — not at 1/3 and 2/3 of the half-court depth. The proportional pixel-space fallback grid's row axis is deliberately **left as equal-thirds** — its 0–1 range is an observed-player-position box, not true court-plane distance, so imposing exact real-line fractions on it would assert a precision that measurement doesn't have. See `zone_grid.py`'s module docstring for the full reasoning.
 3. **Added white-line-based corner refinement** (`court_detector.refine_corners_with_lines`) to correct the green-playing-surface-derived corners (which can run a little short of, or a little past, the actual painted boundary line) against the real detected white lines, with a conservative, fallback-safe design — see Section 9, Phase G.3.
 4. **Answered "should court-box prediction use a trained model instead of a formula?"** (Section 9, Phase G.4): no, not yet — the "camera angle changes the box proportions" problem this idea was raised to solve is already what homography solves (it's a per-video-fit perspective transform, not a fixed box); a trained keypoint-detection model would only be justified if line-detection-based corner refinement (G.3) proves insufficiently robust across many more videos than the two this project currently has.
+5. **Adjusted the back-zone boundary based on visual review of the deployed G.1–G.3 output** (Section 9, Phase G.5): the literal long-service-line boundary (76cm deep) read as too shallow for "deep court" shot placement once seen rendered on real frames. The back zone (1/2/3) now starts further forward — mid (4/5/6) shrunk 20% and that depth was handed to back; front (7/8/9), still the short-service-line boundary, is untouched.
 
-None of this is wired into the default (no-flag) pipeline output yet — the CSV output shape and default zone-mapping method (`use_homography=False`) are unchanged. This document proposes flipping the default in a future phase once G.1–G.3 have been validated across more than two videos.
+None of this is wired into the default (no-flag) pipeline output yet — the CSV output shape and default zone-mapping method (`use_homography=False`) are unchanged. This document proposes flipping the default in a future phase once G.1–G.3 (and now G.5) have been validated across more than two videos.
 
 ---
 
@@ -64,7 +65,14 @@ Standard BWF court dimensions relevant to zone mapping (one player's half, net t
 | Short service line | 198 cm | the net |
 | Long service line (doubles) | 76 cm | the back boundary line (baseline) |
 
-These fixed physical constants (not per-video tuned values) now define the front/mid/back row-zone boundaries for the homography coordinate path — see Phase G.2.
+These fixed physical constants (not per-video tuned values) originally defined the front/mid/back row-zone boundaries for the homography coordinate path — see Phase G.2. **Updated in Phase G.5**: the back boundary is no longer the literal long service line — see below.
+
+| Zone boundary | Depth from net | Basis |
+|---|---|---|
+| Front / mid (7-9 vs 4-6) | 198 cm | Literal short service line — unchanged since G.2 |
+| Mid / back (4-6 vs 1-3) | 514.8 cm | **G.5 adjustment**: literal long-service-line depth (594cm) minus 20% of the literal mid-band depth (396cm × 0.20 = 79.2cm), moved net-ward — not the literal long service line itself |
+
+The mid band (short service line to the mid/back boundary) is 316.8cm — 20% shallower than its literal 396cm BWF span — and the back band is 155.2cm, roughly double its literal 76cm span. Front is unchanged at 198cm.
 
 ---
 
@@ -85,17 +93,17 @@ Zone numbering itself is unchanged (Z1–Z3 back, Z4–Z6 mid, Z7–Z9 front, mi
 ```
                     BASELINE (back)
     ┌───┬───┬───┐   ─┐
-    │ 1 │ 2 │ 3 │    │ back band: 76cm (long service line to baseline)
+    │ 1 │ 2 │ 3 │    │ back band: 155.2cm (G.5-adjusted — starts well before
+    ├───┼───┼───┤   ─┤                     the literal long service line)
+    │ 4 │ 5 │ 6 │    │ mid band: 316.8cm (short service line to the
+    │   │   │   │    │  G.5-adjusted back boundary) — still the largest band
     ├───┼───┼───┤   ─┤
-    │ 4 │ 5 │ 6 │    │ mid band: 396cm (short service line to long service line)
-    │   │   │   │    │  — the largest band, by a wide margin
-    ├───┼───┼───┤   ─┤
-    │ 7 │ 8 │ 9 │    │ front band: 198cm (net to short service line)
+    │ 7 │ 8 │ 9 │    │ front band: 198cm (net to short service line, unchanged)
     └───┴───┴───┘   ─┘
           NET
 ```
 
-- **When a validated per-video homography exists** (`CourtCalibration.homography` is set): row bands use the real BWF line positions above (`zone_grid.zone_number_real`, `court_detector.court_coords_to_zone`). Column bands remain equal-thirds — there is no official line dividing the court width into thirds (only the center line, which splits it in half for serving).
+- **When a validated per-video homography exists** (`CourtCalibration.homography` is set): row bands use the real BWF line positions above, with the Phase G.5 back-band adjustment (`zone_grid.zone_number_real`, `court_detector.court_coords_to_zone`). Column bands remain equal-thirds — there is no official line dividing the court width into thirds (only the center line, which splits it in half for serving).
 - **Otherwise** (the proportional pixel-space fallback, fit from observed player positions): both axes remain equal-thirds (`zone_grid.zone_number`), unchanged from v2.4. Applying the real-line fractions to a player-position-derived box would misrepresent that box as true court-plane distance, which it isn't.
 
 ---
@@ -182,7 +190,7 @@ Generalization check on video 2 (no ground truth zones, coverage only): homograp
 
 **Motivation:** raised directly by user feedback reviewing G.1's demo screenshots: the front/mid boundary should sit at "the white line closest to the net" (the short service line) and the mid/back boundary should sit "closer to the white line in the back" (the long service line) — not at arbitrary equal-thirds points that don't correspond to any painted line.
 
-**Method:** Section 4.5's real distances (198cm from net, 76cm from baseline, over a 670cm half-court depth) give two `net_axis_frac` cut points — `FRONT_BAND_FRAC ≈ 0.7045`, `BACK_BAND_FRAC ≈ 0.1134` — used in place of 1/3 and 2/3. This produces asymmetric bands (front 29.5% of depth, mid 59.1%, back 11.3%) instead of equal 33/33/33.
+**Method:** Section 4.5's real distances (198cm from net, 76cm from baseline, over a 670cm half-court depth) give two `net_axis_frac` cut points — `FRONT_BAND_FRAC ≈ 0.7045`, `BACK_BAND_FRAC ≈ 0.1134` at the time this phase was first implemented — used in place of 1/3 and 2/3. This produced asymmetric bands (front 29.5% of depth, mid 59.1%, back 11.3%) instead of equal 33/33/33. **`BACK_BAND_FRAC` was subsequently revised in Phase G.5 below** (front and the underlying `FRONT_BAND_FRAC` are unchanged).
 
 **Scope decision:** applied only to the homography coordinate path (`court_detector.court_coords_to_zone`, via the new `zone_grid.zone_number_real`), **not** the proportional pixel-space fallback (`court_calibration.zone_for`'s non-homography branch, still `zone_grid.zone_number`, unchanged). The fallback's 0–1 range is an empirically observed player-position box, not verified true court-plane distance — asserting exact real-line fractions on it would claim a precision that measurement doesn't have. The column axis stays equal-thirds on both paths — there's no official line splitting the court width into thirds (only the center line, which splits it in half for serving).
 
@@ -210,6 +218,25 @@ Generalization check on video 2 (no ground truth zones, coverage only): homograp
 2. **"Court corner/line detection itself is sometimes imprecise"** — this is the real remaining gap (G.3's motivation), and IS a place where a trained model (e.g. a court-keypoint-detection network, analogous to how TrackNetV3 was adopted for the shuttle in Phase D rather than hand-rolling motion heuristics) could plausibly do better than the current color-threshold-plus-Hough-lines approach, especially on courts with unusual lighting, mat colors, or camera framing this project's two test videos haven't exposed. But that's a meaningfully heavier lift than G.3 (requires either a pretrained checkpoint that generalizes to this domain, or training data this project doesn't have) and isn't yet justified by evidence — G.3's classical-CV refinement hasn't even been stress-tested against more than synthetic data yet (see G.3's honest-read note).
 
 **Recommendation:** ship and validate G.1–G.3 first (formula + refined classical CV), across more videos than the two currently available, before investing in a trained keypoint model. Revisit this question specifically if/when corner-detection failure rate (tracked via `calibrate_homography`'s own `num_valid_samples` return value, already logged) proves to be a recurring problem across a wider video sample — that would be the concrete, evidence-based trigger to justify the model-training cost, not a decision to make on n=2 videos.
+
+#### G.5 — Back-band adjustment: mid shrunk 20%, back zone extended forward (2026-07-12)
+
+**Motivation:** raised by user visual review of the G.1–G.3 deployed output (fresh screenshots off the real pipeline run, `docs/reports/` — see the confirmation-run review artifact from the 2026-07-11 deployment). The literal long-service-line boundary put the back zone (1/2/3) at just a 76cm-deep strip — visually, this read as too shallow for how a viewer judges "deep court" shot placement against real broadcast footage. Front (7/8/9, the short service line boundary) looked correct as-is and was explicitly left alone.
+
+**Method:** shrink the mid band's depth by a fixed 20% and hand the freed depth to the back band, leaving the front/mid boundary (short service line, 198cm from net) untouched:
+
+- Literal BWF mid depth (short service line to long service line): 396cm
+- New mid depth: 396 × (1 − 0.20) = 316.8cm
+- New back depth: 670 − 198 (front) − 316.8 (mid) = 155.2cm (vs. the literal 76cm)
+- `BACK_BAND_FRAC` updated from ≈0.1134 to 155.2/670 ≈ **0.2316**; `FRONT_BAND_FRAC` unchanged at ≈0.7045
+
+This is implemented as an explicit, traceable adjustment in `zone_grid.py` (`_MID_BAND_SHRINK_FRAC = 0.20`), not a silently-hardcoded replacement fraction — the module keeps the literal BWF mid depth (`_MID_DEPTH_CM_BWF`) alongside the adjusted value so the derivation is auditable from the source. A fixed fraction applied identically to every video (not a per-video tuned value), same posture as the original BWF constants.
+
+**Scope:** homography path only, same as G.2 — the proportional pixel-space fallback's row axis is still equal-thirds and untouched by this adjustment, for the same reason given in G.2 (its 0–1 range isn't verified true court-plane distance).
+
+**Validation:** `tests/test_zone_grid.py::test_band_fracs_are_asymmetric_and_bwf_derived` updated to assert the new `BACK_BAND_FRAC` value and that it's larger than the literal long-service-line fraction. `tests/test_court_detector.py` rewritten to derive its expected y-coordinates from `BACK_BAND_FRAC`/`FRONT_BAND_FRAC` directly (rather than hardcoding depths) so it can't silently drift out of sync if these constants are tuned again, plus two new cases confirming a point 100cm from the baseline — past the literal long service line but inside the new adjusted back band — now correctly classifies as back (previously would have been mid). `debug_overlay._draw_homography_grid` needed no code change since it already reads `BACK_BAND_FRAC`/`FRONT_BAND_FRAC` as shared constants — the drawn grid picks up the new boundary automatically. `pytest` — 66/66 pass after the change (13 tests touched/added across this phase in total).
+
+**Honest read:** this is a qualitative adjustment from visual review, not re-validated against video 1's ground-truth CSV numerically — Section 12's divergence/coverage metrics for G.1 predate this change and haven't been re-measured with G.5 applied. That combined re-measurement (G.2 + G.3 + G.5 together, against ground truth) is still the open item from G.1/G.2 (see Section 13, Q8), now slightly larger in scope.
 
 ---
 
@@ -254,8 +281,9 @@ Generalization check on video 2 (no ground truth zones, coverage only): homograp
 
 | # | Question | Proposed Answer |
 |---|----------|----------------|
-| 8 *(new)* | Should `--homography` become the default (rather than opt-in)? | Not yet — validate G.2 (BWF banding) + G.3 (corner refinement) together, end-to-end, against ground truth on video 1 and a plausibility/coverage check on video 2, the same way G.1 alone was validated. Revisit once that combined number exists. |
+| 8 *(new)* | Should `--homography` become the default (rather than opt-in)? | Not yet — validate G.2 (BWF banding) + G.3 (corner refinement) + G.5 (back-band adjustment) together, end-to-end, against ground truth on video 1 and a plausibility/coverage check on video 2, the same way G.1 alone was validated. Revisit once that combined number exists. |
 | 9 *(new)* | Is the corner-refinement approach (G.3, classical CV) sufficient long-term, or will it eventually need a trained keypoint model? | Not decided — see G.4. Tracked via `calibrate_homography`'s existing `num_valid_samples` return value; a recurring low-sample-count pattern across many videos would be the concrete trigger to revisit. |
+| 10 *(new)* | Is the G.5 back-band adjustment (20% mid shrink) the right amount, or just a first pass? | First pass, from one round of visual review on video 1 only. Worth re-checking against video 2's footage and, once the combined ground-truth re-measurement (Q8) exists, seeing whether it moves row divergence in the right direction rather than just "looking right." |
 
 ---
 
@@ -284,3 +312,4 @@ Generalization check on video 2 (no ground truth zones, coverage only): homograp
 | 2026-07-10 | Replaced equal-thirds row banding with real BWF short/long service line fractions, for the homography path only (not the proportional fallback) | User feedback: the front/mid and mid/back boundaries should track actual painted lines, not arbitrary thirds. Scoped to homography only because the proportional fallback's 0–1 range isn't verified true court-plane distance — applying exact line fractions there would be unjustified precision. |
 | 2026-07-10 | Added white-line-based corner refinement (`refine_corners_with_lines`), fallback-safe by design | User feedback: the drawn court boundary should reference the actual white lines and not exceed the real court. Made conservative (falls back per-edge or entirely on low confidence) so it can't make corner accuracy worse than doing nothing. |
 | 2026-07-10 | Decided against training a court-keypoint ML model for now | The specific problem raised ("camera angle should change box proportions") is already solved by adopting homography (a per-video real-world coordinate fit); a trained model would only be justified for the separate problem of corner-detection robustness, which hasn't yet been stress-tested enough (n=2 videos) to justify the cost. |
+| 2026-07-12 | Shrunk the mid band 20% and gave that depth to the back band (`BACK_BAND_FRAC` ≈0.1134 → ≈0.2316), leaving front unchanged | User visual review of deployed G.1–G.3 output on real frames: the literal 76cm long-service-line back band read as too shallow for "deep court" placement; front looked correct as-is. Scoped to the homography path only, same reasoning as G.2. Not yet re-validated against ground-truth metrics — qualitative visual call, flagged as such (Q10). |

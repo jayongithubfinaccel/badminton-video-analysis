@@ -125,11 +125,11 @@ def _draw_homography_grid(frame: np.ndarray, homography: np.ndarray) -> None:
     are deliberately kept in lockstep so this is a drop-in visual swap, not
     a second zone-numbering scheme to maintain.
     """
-    H_inv = np.linalg.inv(homography)
+    h_inv = np.linalg.inv(homography)
 
     def project(pts: list[tuple[float, float]]) -> np.ndarray:
         arr = np.array([pts], dtype=np.float32)
-        return cv2.perspectiveTransform(arr, H_inv)[0]
+        return cv2.perspectiveTransform(arr, h_inv)[0]
 
     half_len = COURT_LENGTH / 2
     halves = (("top", 0.0, half_len), ("bottom", half_len, COURT_LENGTH))

@@ -13,6 +13,14 @@ Entry format:
 
 ---
 
+## 2026-07-12 — Phase G.5: back-band adjustment (shrink mid 20%, extend back zone) from visual review
+- **Changes**: `src/pipeline/zone_grid.py` — `BACK_BAND_FRAC` (used only by the homography row-banding path, `zone_number_real`) changed from the literal long-service-line fraction (≈0.1134, 76cm back depth) to an adjusted value (≈0.2316, 155.2cm back depth): mid band's depth shrunk 20% (396cm → 316.8cm) and the freed 79.2cm handed to back. Front (`FRONT_BAND_FRAC`, short service line, 198cm) is **unchanged** per explicit user direction. Implemented as traceable constants (`_MID_BAND_SHRINK_FRAC = 0.20`, literal `_MID_DEPTH_CM_BWF` kept alongside the adjusted `_MID_DEPTH_CM`/`_BACK_DEPTH_CM`) rather than a bare replacement number. No other file needed a code change — `court_detector.court_coords_to_zone` and `debug_overlay._draw_homography_grid` both already read `BACK_BAND_FRAC`/`FRONT_BAND_FRAC` as shared constants, so the new boundary took effect automatically.
+- **Tests**: `tests/test_zone_grid.py::test_band_fracs_are_asymmetric_and_bwf_derived` updated to assert the new `BACK_BAND_FRAC` and that it's larger than the literal long-service-line fraction. `tests/test_court_detector.py` rewritten to derive expected y-coordinates from `BACK_BAND_FRAC`/`FRONT_BAND_FRAC` directly instead of hardcoded depths (so it can't silently drift out of sync again), plus 2 new cases confirming a point 100cm from the baseline — past the literal long service line but inside the new back band — now classifies as back instead of mid. `pytest` — 66/66 pass. `ruff check` clean on every touched file (fixed one new `N806` finding introduced in the prior Phase G commit, `H_inv`→`h_inv` in `debug_overlay.py`; remaining repo-wide findings are pre-existing and untouched, same ones noted in the 2026-07-11 entry below).
+- **Manual verification**: pending this session's fresh pipeline re-run (see follow-up) — will confirm via the same zoomed-frame-comparison method used for the corner-refinement change.
+- **Follow-ups**: This is a qualitative adjustment from visual review only, not yet re-validated against video 1's ground-truth CSV numerically (Section 12 of `docs/PRD_v2.6.md` predates this change). Combined re-measurement of G.2+G.3+G.5 together against ground truth remains the concrete next step before considering `--homography` for the default (PRD Q8, now also Q10).
+
+---
+
 ## 2026-07-11 — Real-court-geometry zone mapping (Phase G): homography+fallback, BWF service-line row bands, white-line corner refinement
 - **Changes**: Implements `docs/PRD_v2.6.md` Phase G. All opt-in via the existing (now wired-up) `--homography` CLI flag — default pipeline behavior (no flag) is unchanged.
   - `src/main.py`: added `--homography` flag → `AnalysisPipeline(use_homography=...)` → `calibrate_from_video(..., use_homography=...)` (previously hardcoded `False` with no way to enable it from the CLI at all).

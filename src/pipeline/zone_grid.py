@@ -41,14 +41,21 @@ Two row-banding functions live here, deliberately not one:
   positions, not the true court boundary, so imposing exact real-court-line
   fractions on it would assert a precision the underlying measurement
   doesn't have.
-- `_row_band_real()` — real BWF service-line fractions. Used for the row
-  axis only when the 0.0-1.0 range genuinely IS true court-plane distance
-  (net to baseline), i.e. the homography path
+- `_row_band_real()` — real BWF service-line fractions (front boundary),
+  with one empirical adjustment on the back boundary (see below). Used for
+  the row axis only when the 0.0-1.0 range genuinely IS true court-plane
+  distance (net to baseline), i.e. the homography path
   (court_detector.court_coords_to_zone). There, "equal thirds" was a
   placeholder that doesn't match how the court is actually marked: the
-  front zone (7/8/9) should end at the short service line, close to the
-  net, and the back zone (1/2/3) should start at the long service line,
-  close to the baseline — see docs/PRD_v2.6.md.
+  front zone (7/8/9) ends at the short service line, close to the net —
+  see docs/PRD_v2.6.md.
+
+Back-band adjustment (2026-07-12, PRD Phase G.5): the literal long service
+line put the back zone (1/2/3) at just a 76cm-deep strip, which read as too
+shallow against real footage for "deep court" shot placement on visual
+review. The back boundary was moved forward (further from the baseline) by
+shrinking the mid band 20% and giving that depth to back; front (short
+service line boundary) is untouched. See _MID_BAND_SHRINK_FRAC below.
 """
 
 # Standard BWF court dimensions (Laws of Badminton), one player's half:
@@ -65,10 +72,30 @@ _HALF_COURT_DEPTH_CM = 670.0
 _SHORT_SERVICE_LINE_FROM_NET_CM = 198.0
 _LONG_SERVICE_LINE_FROM_BASELINE_CM = 76.0
 
+# Front zone depth from net — the literal short service line, unchanged by
+# the Phase G.5 back-band adjustment below.
+_FRONT_DEPTH_CM = _SHORT_SERVICE_LINE_FROM_NET_CM  # 198
+
+# Mid zone depth if it ran net-side boundary (short service line) to
+# back-side boundary (long service line) exactly as painted — the literal
+# BWF value, before the empirical adjustment.
+_MID_DEPTH_CM_BWF = (
+    _HALF_COURT_DEPTH_CM - _FRONT_DEPTH_CM - _LONG_SERVICE_LINE_FROM_BASELINE_CM
+)  # 396
+
+# Empirical back-band adjustment (2026-07-12 visual review, docs/PRD_v2.6.md
+# Phase G.5): shrink mid by this fraction and hand the freed depth to back,
+# so the back zone starts noticeably before (net-ward of) the long service
+# line instead of exactly at it. A fixed fraction, not a per-video tuned
+# value — applies identically to every video, same as the BWF constants.
+_MID_BAND_SHRINK_FRAC = 0.20
+_MID_DEPTH_CM = _MID_DEPTH_CM_BWF * (1.0 - _MID_BAND_SHRINK_FRAC)  # 316.8
+_BACK_DEPTH_CM = _HALF_COURT_DEPTH_CM - _FRONT_DEPTH_CM - _MID_DEPTH_CM  # 155.2
+
 # net_axis_frac thresholds (0.0 = own baseline, 1.0 = net) implied by the
-# real line positions above.
-FRONT_BAND_FRAC = 1.0 - _SHORT_SERVICE_LINE_FROM_NET_CM / _HALF_COURT_DEPTH_CM
-BACK_BAND_FRAC = _LONG_SERVICE_LINE_FROM_BASELINE_CM / _HALF_COURT_DEPTH_CM
+# depths above.
+FRONT_BAND_FRAC = 1.0 - _FRONT_DEPTH_CM / _HALF_COURT_DEPTH_CM
+BACK_BAND_FRAC = _BACK_DEPTH_CM / _HALF_COURT_DEPTH_CM
 
 
 def _band(frac: float) -> int:

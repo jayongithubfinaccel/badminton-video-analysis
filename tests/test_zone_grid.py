@@ -81,13 +81,17 @@ def test_zone_number_delegates_through_band_and_mirror():
 
 
 def test_band_fracs_are_asymmetric_and_bwf_derived():
-    """BACK_BAND_FRAC (long service line, 76cm from baseline / 670cm depth)
-    and FRONT_BAND_FRAC (short service line, 198cm from net / 670cm depth)
-    should NOT be the 1/3, 2/3 of equal-thirds banding — that's the whole
-    point of this refinement (docs/PRD_v2.6.md).
+    """FRONT_BAND_FRAC (short service line, 198cm from net / 670cm depth) is
+    the literal BWF value. BACK_BAND_FRAC is the Phase G.5-adjusted value
+    (155.2cm back depth / 670cm) — mid shrunk 20% from its literal
+    396cm (short-to-long-service-line) depth, with that 79.2cm handed to
+    back per 2026-07-12 visual review; front is untouched. Neither should
+    be the 1/3, 2/3 of equal-thirds banding — that's the whole point of
+    this refinement (docs/PRD_v2.6.md).
     """
-    assert BACK_BAND_FRAC == pytest.approx(76.0 / 670.0)
     assert FRONT_BAND_FRAC == pytest.approx(1.0 - 198.0 / 670.0)
+    assert BACK_BAND_FRAC == pytest.approx(155.2 / 670.0)
+    assert BACK_BAND_FRAC > 76.0 / 670.0  # bigger than the literal long-service-line depth
     assert BACK_BAND_FRAC < 1 / 3
     assert FRONT_BAND_FRAC > 2 / 3
     # back+mid+front bands must still partition [0, 1] with no gap/overlap

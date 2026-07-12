@@ -1,9 +1,15 @@
 """Tests for court_detector.py's real-court-plane zone mapping.
 
 Focused on court_coords_to_zone()/zone_from_court_coords() using the real
-BWF short/long service line positions (docs/PRD_v2.6.md) instead of equal
-thirds — the row-axis behavior that's unique to the homography path, not
-covered by test_zone_grid.py's banding-function-level tests.
+BWF short service line position for the front boundary, and the Phase
+G.5-adjusted (not literal long-service-line) back boundary (docs/PRD_v2.6.md)
+instead of equal thirds — the row-axis behavior that's unique to the
+homography path, not covered by test_zone_grid.py's banding-function-level
+tests.
+
+Y-coordinates below are derived from zone_grid's own BACK_BAND_FRAC /
+FRONT_BAND_FRAC rather than hardcoded, so this file can't silently drift out
+of sync if those constants are tuned again.
 """
 
 import cv2
@@ -17,27 +23,28 @@ from src.pipeline.court_detector import (
     refine_corners_with_lines,
     zone_from_court_coords,
 )
+from src.pipeline.zone_grid import BACK_BAND_FRAC, FRONT_BAND_FRAC
 
 assert HALF_COURT_LENGTH == COURT_LENGTH / 2 == 670
 
-# Real BWF line depths from the net, in cm (see zone_grid.py).
-_SHORT_SERVICE_LINE_DEPTH = 198.0
-_LONG_SERVICE_LINE_DEPTH = HALF_COURT_LENGTH - 76.0  # 594
-
-# Absolute y-coordinates of the two BWF lines, for each half.
-_TOP_FRONT_Y = HALF_COURT_LENGTH - _SHORT_SERVICE_LINE_DEPTH  # 472: baseline=0, net=670
-_TOP_BACK_Y = HALF_COURT_LENGTH - _LONG_SERVICE_LINE_DEPTH  # 76
-_BOTTOM_FRONT_Y = HALF_COURT_LENGTH + _SHORT_SERVICE_LINE_DEPTH  # 868: net=670, baseline=1340
-_BOTTOM_BACK_Y = HALF_COURT_LENGTH + _LONG_SERVICE_LINE_DEPTH  # 1264
+# Absolute y-coordinates of the two row-band boundaries, for each half.
+# Top half: net_axis_frac = y / HALF_COURT_LENGTH (0=baseline, 1=net).
+_TOP_FRONT_Y = HALF_COURT_LENGTH * FRONT_BAND_FRAC  # ~472: literal short service line
+_TOP_BACK_Y = HALF_COURT_LENGTH * BACK_BAND_FRAC  # ~155.2: Phase G.5-adjusted
+# Bottom half: net_axis_frac = 1 - (y - HALF_COURT_LENGTH) / HALF_COURT_LENGTH.
+_BOTTOM_FRONT_Y = HALF_COURT_LENGTH + HALF_COURT_LENGTH * (1.0 - FRONT_BAND_FRAC)  # ~868
+_BOTTOM_BACK_Y = HALF_COURT_LENGTH + HALF_COURT_LENGTH * (1.0 - BACK_BAND_FRAC)  # ~1184.8
 
 _LEFT_X, _CENTER_X, _RIGHT_X = COURT_WIDTH * 0.1, COURT_WIDTH * 0.5, COURT_WIDTH * 0.9
 
 
-def test_top_half_back_zone_is_thin_band_near_baseline():
-    # Just inside the baseline (y=10, well short of the long service line at 76)
+def test_top_half_back_zone_extends_past_the_literal_long_service_line():
+    # Just inside the baseline -> back.
     assert court_coords_to_zone(_LEFT_X, 10.0, "top") == 3  # mirrored: screen-left -> zone 3
-    # Just past the long service line is already "mid", not "back" —
-    # the back band is only 76cm deep, not 670/3=223cm.
+    # 100cm depth from baseline is PAST the literal long service line (76cm)
+    # but still inside the Phase G.5-adjusted back band (~155.2cm) -> still back.
+    assert court_coords_to_zone(_LEFT_X, 100.0, "top") == 3
+    # Just past the adjusted boundary -> now mid.
     assert court_coords_to_zone(_LEFT_X, _TOP_BACK_Y + 5.0, "top") == 6
 
 
@@ -57,15 +64,26 @@ def test_bottom_half_front_zone_starts_at_short_service_line():
     assert court_coords_to_zone(_CENTER_X, HALF_COURT_LENGTH + 1.0, "bottom") == 8
 
 
-def test_bottom_half_back_zone_is_thin_band_near_baseline():
+def test_bottom_half_back_zone_extends_past_the_literal_long_service_line():
     assert court_coords_to_zone(_CENTER_X, COURT_LENGTH - 5.0, "bottom") == 2  # inside back band
+    # 100cm depth from baseline (COURT_LENGTH-100) is past the literal long
+    # service line but still inside the adjusted back band -> still back.
+    assert court_coords_to_zone(_CENTER_X, COURT_LENGTH - 100.0, "bottom") == 2
     assert court_coords_to_zone(_CENTER_X, _BOTTOM_BACK_Y - 5.0, "bottom") == 5  # still mid
 
 
-def test_mid_zone_spans_most_of_the_half_court():
-    """The mid band (short service line to long service line) is the
-    largest of the three — this is the concrete effect of using real BWF
-    lines instead of equal thirds (mid used to be exactly 1/3)."""
+def test_mid_zone_is_smaller_than_the_literal_bwf_span_but_still_the_largest_band():
+    """Mid (short service line to the Phase G.5-adjusted back boundary) is
+    20% shallower than the literal BWF short-to-long-service-line span, but
+    still the largest of the three bands."""
+    front_depth = HALF_COURT_LENGTH * (1.0 - FRONT_BAND_FRAC)
+    back_depth = HALF_COURT_LENGTH * BACK_BAND_FRAC
+    mid_depth = HALF_COURT_LENGTH - front_depth - back_depth
+
+    assert mid_depth < 396.0  # literal BWF mid depth (short-to-long service line)
+    assert mid_depth > front_depth
+    assert mid_depth > back_depth
+
     midpoint_y = (_TOP_FRONT_Y + _TOP_BACK_Y) / 2
     assert court_coords_to_zone(_CENTER_X, midpoint_y, "top") == 5
 
