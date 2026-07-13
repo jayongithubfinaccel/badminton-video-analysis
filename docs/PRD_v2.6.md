@@ -312,6 +312,7 @@ Versus the G.1-era hybrid numbers (equal-thirds rows via homography, no corner r
 | 8 *(resolved, G.6)* | Should `--homography` become the default (rather than opt-in)? | **No, decided.** The combined re-measurement (G.6) showed column accuracy improved (0.189→0.151) but row accuracy regressed (0.226→0.453, worse than even the shipped proportional grid's 0.340) — a real, known cost, kept deliberately (see Q10). Opt-in remains the right posture until/unless the row-axis question is revisited. |
 | 9 *(new)* | Is the corner-refinement approach (G.3, classical CV) sufficient long-term, or will it eventually need a trained keypoint model? | Not decided — see G.4. Tracked via `calibrate_homography`'s existing `num_valid_samples` return value; a recurring low-sample-count pattern across many videos would be the concrete trigger to revisit. |
 | 10 *(resolved, G.6)* | Is the G.5 back-band adjustment (20% mid shrink) the right amount, or just a first pass? | **Decided 2026-07-12: keep it as-is.** Confirmed it moves row divergence in the wrong direction (0.226→0.453 vs ground truth) — a real, measured cost, not a hunch. Kept anyway for visual/product reasons (the back zone reading correctly against real footage was the point of the change); the row-accuracy cost is accepted, not overlooked. Not reverted, not retuned. |
+| 11 *(new, 2026-07-13)* | Should rally 1's 6-second intro-skip be lengthened, now that the per-shot audit re-confirmed it's too short (4 of 55 shots land on ceremony footage)? | Not decided — this predates Phase G entirely (flagged 2026-07-03) and is out of scope for court-zone-mapping work specifically, but it's now visibly costing this video's own ground-truth accuracy numbers (those 4 shots can't possibly score correctly). Worth fixing on its own merits independent of anything else in this PRD. |
 
 ---
 
@@ -325,6 +326,14 @@ Versus the G.1-era hybrid numbers (equal-thirds rows via homography, no corner r
 |---|---|
 | `docs/reports/court_zone_homography_vs_proportional.html` | Method comparison (homography vs. proportional grid), visual grid-vs-ground-truth comparison on both videos, the G.1 metrics table |
 | `docs/reports/court_zone_homography_example_video1.html` | Full pipeline re-run example: frame screenshots and a video clip showing the homography grid tracking players/racket/shuttle live |
+| `docs/reports/phase_g_deploy_review.html` | Fresh confirmation-run screenshots after the initial Phase G deploy |
+| `docs/reports/phase_g5_before_after_review.html` | Same frames, before/after the G.5 back-band adjustment — visual confirmation the boundary actually moved |
+| `docs/reports/both_videos_frame_review.html` | Frame review across both ground-truth videos on the deployed code |
+| `docs/reports/ground_truth_per_shot_comparison.html` | **G.6 supporting detail**: all 53 ground-truth-matched shots, each with the exact frame used for zone mapping, predicted vs. true zone, and result (exact/adjacent/miss) — filterable by result. Source of the ceremony-frame finding below. |
+| `docs/results/csv/` | Latest per-shot analysis CSVs (both videos), `--homography` enabled |
+| `docs/results/gt_comparison_frames_video1/` | The 53 individual annotated frame images backing the per-shot comparison report, plus `records.json` (full per-shot data: rally, sequence, receiver, predicted/ground-truth zone, result, source frame) |
+
+**New finding from building the per-shot report (2026-07-13), not previously documented:** rally 1's first 4 shots (frames 180–294, ~6–10s into the video) land on pre-match ceremony/coin-toss footage, not real rally play — their "ground truth miss" is a data-quality artifact, not a zone-mapping error. Root cause: the already-known, previously-flagged issue that rally 1's 6-second intro-skip is too short for this video (see the 2026-07-03 `DEPLOYMENT_LOG.md` entry, "Follow-ups") — this per-shot audit is what made it visible again, not a new bug from this phase. Not fixed as part of this work; flagged as a candidate follow-up (see Section 13).
 
 ---
 
